@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  markdown-lint:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Markdown Lint
+      uses: nosborn/github-action-markdown-cli@v3.3.0
+      with:
+        files: .
+        config_file: .markdownlintrc
+
+  spell-check:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Check spelling
+      uses: crate-ci/typos@master
+      with:
+        files: .
+        ignore-words: "nd,ser,nd,pytorch"
+
+  validate-code-examples:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.10', '3.12']
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install PyTorch and dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+        pip install numpy pandas transformers
+
+    - name: Run basic syntax validation
+      run: |
+        python -m py_compile $(find . -name "*.py" -type f 2>/dev/null || true)
+
+  docs-build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Validate README
+      run: |
+        if [ ! -f README.md ]; then
+          echo "README.md not found!"
+          exit 1
+        fi
+
+    - name: Check all modules exist
+      run: |
+        for i in {00..15}; do
+          if [ ! -f "${i}_*.md" ]; then
+            echo "Module ${i} not found!"
+            exit 1
+          fi
+        done
+
+    - name: Validate markdown syntax
+      run: |
+        python -c "
+        import re
+        import glob
+        for file in glob.glob('*.md'):
+          with open(file) as f:
+            content = f.read()
+            # Check for unclosed code blocks
+            if content.count('\`\`\`') % 2 != 0:
+              print(f'Unclosed code block in {file}')
+              exit(1)
+        "
+
+    - name: Check project files
+      run: |
+        if [ ! -f PROJECTS_AND_SOLUTIONS.md ]; then
+          echo "PROJECTS_AND_SOLUTIONS.md not found!"
+          exit 1
+        fi
+        if [ ! -f QUIZ_BANK.md ]; then
+          echo "QUIZ_BANK.md not found!"
+          exit 1
+        fi

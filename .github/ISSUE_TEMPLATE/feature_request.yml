@@ -1,0 +1,47 @@
+name: Feature Request
+description: Suggest a new module, topic, or improvement
+title: "[FEATURE] "
+labels: ["enhancement"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for your suggestion! Help us improve the course.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What would you like to see added or improved?
+      placeholder: |
+        Example: Add a module on efficient inference with torch.export and ExecuTorch.
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Why is this important? Who would benefit?
+      placeholder: |
+        Example: Mobile and edge deployment is increasingly important for production ML systems.
+
+  - type: textarea
+    id: implementation
+    attributes:
+      label: Suggested Implementation
+      description: (Optional) How would you approach this?
+      placeholder: |
+        Example: Add a new module covering torch.export, ExecuTorch, and mobile optimization patterns.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: This is not a duplicate of an existing feature request
+          required: true
+        - label: This aligns with the course's scope (PyTorch fundamentals to advanced)
+          required: true

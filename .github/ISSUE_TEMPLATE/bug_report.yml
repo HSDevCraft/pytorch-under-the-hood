@@ -1,0 +1,83 @@
+name: Bug Report
+description: Report an error, typo, or unclear explanation in the course
+title: "[BUG] "
+labels: ["bug"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve the PyTorch Course!
+
+  - type: dropdown
+    id: module
+    attributes:
+      label: Module
+      description: Which module contains the issue?
+      options:
+        - "00: Prerequisites & Setup"
+        - "01: Tensors & Fundamentals"
+        - "02: Autograd & Computation Graphs"
+        - "03: Neural Networks with nn.Module"
+        - "04: Training Pipeline Fundamentals"
+        - "05: Convolutional Neural Networks"
+        - "06: Transfer Learning & Fine-Tuning"
+        - "07: Recurrent Networks & Sequences"
+        - "08: Attention & Transformers"
+        - "09: Advanced Training Techniques"
+        - "10: GPU Performance & Mixed Precision"
+        - "11: Distributed Training & Scaling"
+        - "12: Model Optimization, Quantization & Pruning"
+        - "13: Deployment — TorchScript & ONNX"
+        - "14: Serving & Production"
+        - "15: Evaluation & Interpretability"
+        - "PROJECTS_AND_SOLUTIONS"
+        - "QUIZ_BANK"
+        - "README"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What is the issue? (typo, unclear explanation, broken code example, etc.)
+      placeholder: |
+        Example: The attention mechanism code on line 245 has incorrect dimension handling.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What should happen instead?
+      placeholder: |
+        Example: The code should produce attention weights of shape (batch, seq_len, seq_len).
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happens?
+      placeholder: |
+        Example: RuntimeError: expected size 1, index 2, but got size 64
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: PyTorch version, Python version, GPU info, etc.
+      placeholder: |
+        PyTorch 2.1.0, Python 3.10, CUDA 12.1, A100 GPU
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched for existing issues
+          required: true
+        - label: This is a course content issue, not a general PyTorch question
+          required: true
