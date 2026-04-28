@@ -1,682 +1,628 @@
-# Module 14: Serving & Production Systems
+# Module 14: Serving & Production — From Model to Live API
+
+> **Goal:** Build production-grade ML serving systems — from a simple FastAPI server to auto-scaling Kubernetes deployments with real-time monitoring.
+
+---
 
 ## Learning Objectives
-By the end of this module you will be able to:
-- Build a production-ready REST API for model inference using FastAPI
-- Deploy models with TorchServe for multi-model, batched serving
-- Implement request batching, caching, and async inference
-- Write health checks, readiness probes, and graceful shutdown
-- Containerise PyTorch inference services with Docker
-- Set up Kubernetes deployments with GPU node selectors and autoscaling
-- Monitor model performance, latency, and drift in production
+
+By the end of this module, you will:
+- **Build** a production FastAPI inference server with proper error handling
+- **Implement** dynamic batching to maximize GPU utilization
+- **Configure** TorchServe for scalable model serving
+- **Containerize** with Docker and deploy on Kubernetes
+- **Monitor** with Prometheus metrics (latency, throughput, errors)
+- **Run** A/B tests between model versions
 
 ---
 
-## 14.1 Production Serving Architecture
+## Part 1: The Production Serving Architecture
+
+### 1.1 Why Production Serving Is Hard
+
+A research notebook is not a serving system. Production requires:
+- **Concurrency:** Handle 1000 simultaneous requests
+- **Reliability:** 99.99% uptime, graceful error handling
+- **Performance:** < 50ms p95 latency under load
+- **Observability:** Know what's failing and why
+- **Scalability:** Auto-scale with traffic
+- **Safety:** Input validation, rate limiting, authentication
 
 ```
-                    ┌─────────────────────┐
-         Client     │   Load Balancer      │
-         Requests → │   (nginx / k8s SVC)  │
-                    └──────────┬──────────┘
-                               │
-              ┌────────────────┼────────────────┐
-              ▼                ▼                ▼
-       ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
-       │ API Pod 0   │  │ API Pod 1   │  │ API Pod 2   │
-       │ FastAPI /   │  │ FastAPI /   │  │ FastAPI /   │
-       │ TorchServe  │  │ TorchServe  │  │ TorchServe  │
-       │ GPU:0       │  │ GPU:1       │  │ GPU:2       │
-       └──────┬──────┘  └──────┬──────┘  └──────┬──────┘
-              │                │                │
-              └────────────────┴────────────────┘
-                               │
-                    ┌──────────┴──────────┐
-                    │  Model Registry /    │
-                    │  Object Storage     │
-                    │  (S3/GCS/MLflow)    │
-                    └─────────────────────┘
+Client Request Flow:
+Browser/App → Load Balancer → Inference Server → Model → Response
+                                     ↓
+                               Monitoring (Prometheus)
+                               Logging (structlog)
+                               Tracing (OpenTelemetry)
 ```
 
 ---
 
-## 14.2 Production FastAPI Inference Server
+## Part 2: FastAPI Inference Server
+
+### 2.1 Production-Grade Server Implementation
 
 ```python
 # inference_server.py
-import asyncio
-import time
-import uuid
-from contextlib import asynccontextmanager
-from typing import List, Optional
-import threading
-
 import torch
 import torch.nn as nn
+import asyncio
+import time
+import logging
+from contextlib import asynccontextmanager
+from typing import List
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, validator
 import numpy as np
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-import uvicorn
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ── Model wrapper ─────────────────────────────────────────────────────────────
+class ModelInference:
+    """
+    Thread-safe model wrapper with device management and error handling.
+    
+    Design decisions:
+    1. Singleton pattern — load model once, reuse for all requests
+    2. eval() mode always set — Dropout off, BN uses running stats
+    3. torch.no_grad() — no gradient tracking = faster + less memory
+    4. asyncio.Lock() — prevent concurrent GPU access (race conditions)
+    """
+    
+    def __init__(self, model_path: str, device: str = 'auto'):
+        self.device = self._select_device(device)
+        self.model = self._load_model(model_path)
+        self._lock = asyncio.Lock()  # Prevent concurrent GPU access
+        logger.info(f"Model loaded on {self.device}")
+    
+    def _select_device(self, device: str) -> torch.device:
+        if device == 'auto':
+            return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        return torch.device(device)
+    
+    def _load_model(self, path: str) -> nn.Module:
+        # Load TorchScript model (no model class definition needed!)
+        model = torch.jit.load(path, map_location=self.device)
+        model.eval()
+        return model
+    
+    async def predict(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Async prediction with exclusive GPU access.
+        
+        async + Lock prevents multiple coroutines from accessing GPU simultaneously.
+        Without Lock: GPU context switching overhead, potential memory errors.
+        """
+        async with self._lock:
+            # Move input to model's device
+            x = x.to(self.device)
+            
+            with torch.no_grad():
+                logits = self.model(x)
+            
+            return logits.cpu()  # Return to CPU (serializable)
 
 
-# ── Request / Response schemas ────────────────────────────────────────────────
+# ── Request/Response schemas ──────────────────────────────────────────────────
 class PredictRequest(BaseModel):
-    inputs: List[List[float]] = Field(..., description="Batch of input feature vectors")
-    return_probabilities: bool = False
+    """
+    Pydantic models provide automatic:
+    - Type coercion (list → np.array → tensor)
+    - Input validation (shapes, ranges)
+    - OpenAPI documentation
+    """
+    instances: List[List[float]]  # List of feature vectors
+    
+    @validator('instances')
+    def validate_shape(cls, v):
+        if not v:
+            raise ValueError("instances cannot be empty")
+        n_features = len(v[0])
+        if not all(len(row) == n_features for row in v):
+            raise ValueError("All instances must have the same number of features")
+        if n_features != 784:
+            raise ValueError(f"Expected 784 features, got {n_features}")
+        return v
 
-class PredictionResult(BaseModel):
-    prediction_id: str
-    predictions: List[int]
-    probabilities: Optional[List[List[float]]] = None
-    latency_ms: float
+class PredictResponse(BaseModel):
+    predictions: List[int]          # Predicted class indices
+    probabilities: List[List[float]] # Class probabilities
+    latency_ms: float                # Server-side inference time
+    model_version: str               # For tracking which model served
 
-class HealthResponse(BaseModel):
-    status: str
-    model_loaded: bool
-    device: str
-    uptime_s: float
+# ── Application lifecycle ─────────────────────────────────────────────────────
+# Lifespan: modern FastAPI pattern for startup/shutdown (replaces on_event)
+model_inference: ModelInference = None
 
-
-# ── Global model holder ────────────────────────────────────────────────────────
-class ModelHolder:
-    def __init__(self):
-        self.model: Optional[nn.Module] = None
-        self.device: Optional[torch.device] = None
-        self._lock = asyncio.Lock()
-        self.n_requests = 0
-        self.total_latency_ms = 0.0
-        self.start_time = time.time()
-
-    def load(self, model_path: str, device: str = "auto"):
-        if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(device)
-
-        # Load TorchScript model
-        self.model = torch.jit.load(model_path, map_location=self.device)
-        self.model.eval()
-
-        # Warmup — fill GPU pipeline
-        dummy = torch.zeros(1, 10, device=self.device)
-        with torch.inference_mode():
-            for _ in range(5):
-                self.model(dummy)
-
-        print(f"Model loaded on {self.device}")
-
-
-holder = ModelHolder()
-
-
-# ── Lifespan: startup & shutdown ──────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    holder.load("model.pt", device="auto")
-    yield
-    # Shutdown
-    print("Shutting down inference server...")
-    if holder.device and holder.device.type == "cuda":
+    """Load model at startup, release at shutdown"""
+    global model_inference
+    
+    logger.info("Loading model...")
+    model_inference = ModelInference(
+        model_path="model_traced.pt",
+        device='auto'
+    )
+    logger.info("Model ready — server starting")
+    
+    yield  # Application runs here
+    
+    # Cleanup on shutdown
+    logger.info("Shutting down — releasing model")
+    del model_inference
+    if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-
-# ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="PyTorch Inference API",
+    title="ML Inference API",
     version="1.0.0",
     lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["POST", "GET"],
-    allow_headers=["*"],
-)
-
+# ── Middleware: request logging ───────────────────────────────────────────────
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log every request with method, path, and response time"""
+    start = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = (time.perf_counter() - start) * 1000
+    logger.info(
+        f"{request.method} {request.url.path} "
+        f"status={response.status_code} "
+        f"latency={duration_ms:.1f}ms"
+    )
+    return response
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
-@app.get("/health", response_model=HealthResponse)
-async def health():
-    return HealthResponse(
-        status="ok" if holder.model is not None else "loading",
-        model_loaded=holder.model is not None,
-        device=str(holder.device),
-        uptime_s=time.time() - holder.start_time,
-    )
-
-
-@app.post("/predict", response_model=PredictionResult)
-async def predict(req: PredictRequest):
-    if holder.model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded yet")
-
-    t0 = time.perf_counter()
-    prediction_id = str(uuid.uuid4())
-
-    async with holder._lock:
-        try:
-            x = torch.tensor(req.inputs, dtype=torch.float32, device=holder.device)
-
-            with torch.inference_mode():
-                logits = holder.model(x)
-                probs  = torch.softmax(logits, dim=-1)
-                preds  = probs.argmax(dim=-1)
-
-        except Exception as e:
-            raise HTTPException(status_code=422, detail=f"Inference failed: {e}")
-
-    latency_ms = 1000 * (time.perf_counter() - t0)
-    holder.n_requests += 1
-    holder.total_latency_ms += latency_ms
-
-    return PredictionResult(
-        prediction_id=prediction_id,
-        predictions=preds.tolist(),
-        probabilities=probs.tolist() if req.return_probabilities else None,
-        latency_ms=round(latency_ms, 3),
-    )
-
-
-@app.get("/metrics")
-async def metrics():
-    avg_latency = (
-        holder.total_latency_ms / holder.n_requests if holder.n_requests > 0 else 0.0
-    )
-    mem_info = {}
-    if holder.device and holder.device.type == "cuda":
-        mem_info = {
-            "gpu_allocated_gb": round(torch.cuda.memory_allocated() / 1e9, 3),
-            "gpu_reserved_gb":  round(torch.cuda.memory_reserved() / 1e9, 3),
-        }
+@app.get("/health")
+async def health_check():
+    """
+    Kubernetes liveness + readiness probe.
+    Returns 200 if model is loaded and ready.
+    """
+    if model_inference is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    device = str(model_inference.device)
     return {
-        "n_requests": holder.n_requests,
-        "avg_latency_ms": round(avg_latency, 3),
-        **mem_info,
+        "status": "healthy",
+        "device": device,
+        "model_loaded": True,
     }
 
+@app.post("/predict", response_model=PredictResponse)
+async def predict(request: PredictRequest):
+    """
+    Main inference endpoint.
+    
+    Error handling:
+    - 422: Pydantic validation errors (bad input format)
+    - 500: Model inference errors (internal)
+    - 503: Model not loaded (startup incomplete)
+    """
+    if model_inference is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    inference_start = time.perf_counter()
+    
+    try:
+        # Convert list → numpy → tensor
+        x = torch.tensor(request.instances, dtype=torch.float32)
+        
+        # Run inference
+        logits = await model_inference.predict(x)
+        
+        # Post-process
+        probabilities = torch.softmax(logits, dim=-1)
+        predictions = logits.argmax(dim=-1)
+        
+        latency_ms = (time.perf_counter() - inference_start) * 1000
+        
+        return PredictResponse(
+            predictions=predictions.tolist(),
+            probabilities=probabilities.tolist(),
+            latency_ms=latency_ms,
+            model_version="1.0.0",
+        )
+    
+    except Exception as e:
+        logger.error(f"Inference failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
 
-if __name__ == "__main__":
-    uvicorn.run("inference_server:app", host="0.0.0.0", port=8000, workers=1)
+# Run: uvicorn inference_server:app --host 0.0.0.0 --port 8000 --workers 1
+# Note: workers=1 for GPU servers! Multiple workers = multiple model copies in GPU memory
 ```
 
 ---
 
-## 14.3 Dynamic Batching
+## Part 3: Dynamic Batching
 
-Instead of processing each request independently, accumulate requests and process them as a batch — dramatically improves GPU utilisation.
+### 3.1 Why Batch Requests Together
+
+```
+Without batching:
+  Request 1 → GPU → Response   (GPU 5% utilized)
+  Request 2 → GPU → Response   (GPU 5% utilized)
+  ...
+  Throughput: 20 req/sec
+
+With dynamic batching:
+  Request 1 ─┐
+  Request 2  ├─ wait 10ms → batch(1,2,3,4) → GPU → Responses
+  Request 3  │                               (GPU 80% utilized)
+  Request 4 ─┘
+  Throughput: 200 req/sec (10× improvement!)
+```
 
 ```python
 import asyncio
-import time
+from typing import Tuple
 import torch
-from typing import List
-from dataclasses import dataclass, field
-
-@dataclass
-class InferenceRequest:
-    tensor: torch.Tensor
-    result_future: asyncio.Future = field(default_factory=asyncio.Future)
 
 class DynamicBatcher:
     """
-    Collects individual requests, batches them, runs inference,
-    then distributes results back to each request's future.
+    Collects individual inference requests and batches them for GPU efficiency.
+    
+    Key parameters:
+    - max_batch_size: hard cap on batch size (memory constraint)
+    - max_wait_ms: maximum wait time before processing partial batch
+      - Small: low latency, low throughput
+      - Large: higher latency, high throughput
+      - Tune based on SLA requirements
     """
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        device: torch.device,
-        max_batch_size: int = 32,
-        max_wait_ms: float = 10.0,
-    ):
-        self.model          = model
-        self.device         = device
+    
+    def __init__(self, model: nn.Module, max_batch_size: int = 32,
+                 max_wait_ms: float = 10.0):
+        self.model = model
         self.max_batch_size = max_batch_size
-        self.max_wait_ms    = max_wait_ms
-        self.queue: asyncio.Queue = asyncio.Queue()
-        self._running = False
-
+        self.max_wait_s = max_wait_ms / 1000.0
+        
+        # Queue of (tensor, Future) pairs
+        # Each request adds itself to the queue and waits for a result
+        self._queue: asyncio.Queue[Tuple[torch.Tensor, asyncio.Future]] = asyncio.Queue()
+        self._worker_task: asyncio.Task = None
+    
     async def start(self):
-        self._running = True
-        asyncio.create_task(self._batch_worker())
-
+        """Start the background batching worker"""
+        self._worker_task = asyncio.create_task(self._worker())
+    
     async def stop(self):
-        self._running = False
-
-    async def infer(self, x: torch.Tensor) -> torch.Tensor:
-        """Submit a single tensor; wait for result."""
+        """Clean up worker"""
+        if self._worker_task:
+            self._worker_task.cancel()
+            await asyncio.gather(self._worker_task, return_exceptions=True)
+    
+    async def predict(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Submit a single sample for batched inference.
+        Returns when the batch is processed.
+        """
         future = asyncio.get_event_loop().create_future()
-        await self.queue.put(InferenceRequest(tensor=x, result_future=future))
-        return await future
-
-    async def _batch_worker(self):
-        while self._running:
-            # Collect requests up to max_batch_size or max_wait_ms
-            requests: List[InferenceRequest] = []
-            deadline = time.monotonic() + self.max_wait_ms / 1000
-
-            # Wait for at least one request
-            try:
-                req = await asyncio.wait_for(self.queue.get(), timeout=0.1)
-                requests.append(req)
-            except asyncio.TimeoutError:
-                continue
-
-            # Drain more requests until batch is full or deadline passed
-            while len(requests) < self.max_batch_size:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
+        await self._queue.put((x, future))
+        return await future  # Wait for batch to complete
+    
+    async def _worker(self):
+        """
+        Background worker: collects requests and runs batched inference.
+        
+        Strategy:
+        1. Wait for first request (block until something arrives)
+        2. Collect more requests for up to max_wait_ms
+        3. Run batch inference
+        4. Set results on individual futures
+        """
+        while True:
+            # Step 1: Wait for at least one request
+            first_tensor, first_future = await self._queue.get()
+            
+            batch_tensors = [first_tensor]
+            batch_futures = [first_future]
+            
+            # Step 2: Collect more requests up to limits
+            deadline = asyncio.get_event_loop().time() + self.max_wait_s
+            
+            while (len(batch_tensors) < self.max_batch_size and
+                   asyncio.get_event_loop().time() < deadline):
                 try:
-                    req = await asyncio.wait_for(self.queue.get(), timeout=remaining)
-                    requests.append(req)
+                    # Non-blocking check for more requests (tiny timeout)
+                    tensor, future = await asyncio.wait_for(
+                        self._queue.get(), timeout=0.001
+                    )
+                    batch_tensors.append(tensor)
+                    batch_futures.append(future)
                 except asyncio.TimeoutError:
-                    break
-
-            # Run batched inference
-            batch = torch.stack([r.tensor for r in requests]).to(self.device)
+                    break  # No more requests ready; process what we have
+            
+            # Step 3: Run batch inference
+            batch = torch.stack(batch_tensors, dim=0)
+            
             try:
-                with torch.inference_mode():
-                    outputs = self.model(batch)
-                for i, req in enumerate(requests):
-                    req.result_future.set_result(outputs[i])
+                with torch.no_grad():
+                    outputs = self.model(batch)  # Shape: (batch_size, n_classes)
+                
+                # Step 4: Return individual results
+                for i, future in enumerate(batch_futures):
+                    if not future.cancelled():
+                        future.set_result(outputs[i])
+            
             except Exception as e:
-                for req in requests:
-                    req.result_future.set_exception(e)
+                # On failure, propagate exception to all waiting requests
+                for future in batch_futures:
+                    if not future.cancelled():
+                        future.set_exception(e)
 ```
 
 ---
 
-## 14.4 TorchServe
+## Part 4: Docker Containerization
 
-TorchServe is PyTorch's official production model server. It handles multi-model serving, batching, versioning, and management APIs.
-
-```python
-# ── 1. Write a custom handler ──────────────────────────────────────────────────
-# my_handler.py
-import torch
-import torch.nn.functional as F
-from ts.torch_handler.base_handler import BaseHandler
-from ts.utils.util import map_class_to_label
-
-class ClassificationHandler(BaseHandler):
-    """
-    Custom TorchServe handler for image classification.
-    Inherits BaseHandler which manages model loading + context.
-    """
-
-    def initialize(self, context):
-        """Load model and preprocessing config."""
-        super().initialize(context)
-        self.model.eval()
-
-    def preprocess(self, data):
-        """Convert raw request bytes to tensor."""
-        from PIL import Image
-        import torchvision.transforms as T
-        import io
-
-        transform = T.Compose([
-            T.Resize(256), T.CenterCrop(224), T.ToTensor(),
-            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
-        tensors = []
-        for row in data:
-            img_bytes = row.get("data") or row.get("body")
-            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            tensors.append(transform(img))
-        return torch.stack(tensors)
-
-    def inference(self, x: torch.Tensor):
-        with torch.no_grad():
-            return self.model(x.to(self.device))
-
-    def postprocess(self, logits: torch.Tensor):
-        probs = F.softmax(logits, dim=-1)
-        top5_probs, top5_idx = probs.topk(5, dim=-1)
-        results = []
-        for probs_i, idx_i in zip(top5_probs, top5_idx):
-            results.append({
-                str(i.item()): float(p.item())
-                for p, i in zip(probs_i, idx_i)
-            })
-        return results
-```
-
-```bash
-# ── 2. Package model archive ────────────────────────────────────────────────
-torch-model-archiver \
-    --model-name resnet50 \
-    --version 1.0 \
-    --serialized-file resnet50_traced.pt \
-    --handler my_handler.py \
-    --extra-files imagenet_classes.json \
-    --output-path model_store/
-
-# ── 3. Start TorchServe ────────────────────────────────────────────────────
-torchserve \
-    --start \
-    --model-store model_store \
-    --models resnet50=resnet50.mar \
-    --ts-config config.properties \
-    --log-config log4j.properties
-
-# config.properties
-# inference_address=http://0.0.0.0:8080
-# management_address=http://0.0.0.0:8081
-# metrics_address=http://0.0.0.0:8082
-# number_of_netty_threads=4
-# job_queue_size=1000
-# batch_size=32
-# max_batch_delay=100  # ms
-# default_workers_per_model=2
-
-# ── 4. Use the API ────────────────────────────────────────────────────────
-# curl -X POST http://localhost:8080/predictions/resnet50 -T image.jpg
-# curl http://localhost:8081/models/resnet50  # management API
-# curl http://localhost:8082/metrics           # Prometheus metrics
-```
-
----
-
-## 14.5 Dockerising the Inference Server
+### 4.1 Production Dockerfile
 
 ```dockerfile
 # Dockerfile
-FROM nvcr.io/nvidia/pytorch:24.01-py3
+# Multi-stage build: keep production image slim
+
+# ── Stage 1: Builder ──────────────────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+COPY requirements.txt .
+
+# Install dependencies in virtual env (isolate from system Python)
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# ── Stage 2: Production ───────────────────────────────────────────────────────
+FROM python:3.11-slim
+
+# Security: run as non-root user
+RUN useradd --create-home --uid 1001 appuser
 
 WORKDIR /app
 
-# Install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy virtual env from builder (avoids re-installing)
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy source and model
+# Copy application code
 COPY inference_server.py .
-COPY model.pt .
+COPY model_traced.pt .
 
-# Non-root user
-RUN useradd -m -u 1000 mluser
-USER mluser
+# Change ownership to non-root user
+RUN chown -R appuser:appuser /app
+
+USER appuser
 
 EXPOSE 8000
 
-# Healthcheck
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+# Health check: Docker marks container unhealthy if /health fails
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-CMD ["uvicorn", "inference_server:app", \
-     "--host", "0.0.0.0", \
-     "--port", "8000", \
-     "--workers", "1", \
-     "--loop", "uvloop"]
+CMD ["uvicorn", "inference_server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
 ```
 
 ```bash
-# Build and push
-docker build -t my-inference-server:v1.0 .
-docker push my-inference-server:v1.0
+# Build and run
+docker build -t ml-inference:v1.0 .
+docker run -p 8000:8000 --gpus all ml-inference:v1.0
 
-# Run with GPU
-docker run --gpus all -p 8000:8000 my-inference-server:v1.0
-
-# Test
-curl -s -X POST http://localhost:8000/predict \
-    -H "Content-Type: application/json" \
-    -d '{"inputs": [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]]}'
+# Test the running server
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"instances": [[0.0]*784]}'
 ```
 
 ---
 
-## 14.6 Kubernetes Deployment
+## Part 5: Monitoring with Prometheus
 
-```yaml
-# k8s/deployment.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: pytorch-inference
-  labels:
-    app: pytorch-inference
-    version: v1.0
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: pytorch-inference
-  template:
-    metadata:
-      labels:
-        app: pytorch-inference
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/path: "/metrics"
-        prometheus.io/port: "8000"
-    spec:
-      containers:
-      - name: inference
-        image: my-inference-server:v1.0
-        ports:
-        - containerPort: 8000
-        resources:
-          requests:
-            memory: "4Gi"
-            cpu: "2"
-            nvidia.com/gpu: "1"
-          limits:
-            memory: "8Gi"
-            cpu: "4"
-            nvidia.com/gpu: "1"
-        env:
-        - name: CUDA_VISIBLE_DEVICES
-          value: "0"
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: 8000
-          initialDelaySeconds: 30
-          periodSeconds: 10
-          failureThreshold: 3
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 8000
-          initialDelaySeconds: 60
-          periodSeconds: 30
-      nodeSelector:
-        accelerator: nvidia-tesla-a100
-      tolerations:
-      - key: nvidia.com/gpu
-        operator: Exists
-        effect: NoSchedule
----
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: pytorch-inference-hpa
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: pytorch-inference
-  minReplicas: 1
-  maxReplicas: 10
-  metrics:
-  - type: Resource
-    resource:
-      name: cpu
-      target:
-        type: Utilization
-        averageUtilization: 70
-```
-
----
-
-## 14.7 Production Monitoring & Alerting
+### 5.1 Instrumenting Your Server
 
 ```python
-# monitoring.py — Prometheus metrics for the inference server
-from prometheus_client import Counter, Histogram, Gauge, start_http_server
+# metrics.py — Prometheus metrics for ML serving
+from prometheus_client import (
+    Counter, Histogram, Gauge,
+    generate_latest, CONTENT_TYPE_LATEST
+)
+from fastapi import Response
+
+# ── Define metrics ────────────────────────────────────────────────────────────
+# Counter: monotonically increasing (requests, errors)
+REQUEST_COUNT = Counter(
+    'ml_request_total',
+    'Total inference requests',
+    labelnames=['endpoint', 'status'],  # Dimensions for filtering
+)
+
+# Histogram: distribution of values (latency percentiles)
+REQUEST_LATENCY = Histogram(
+    'ml_request_latency_seconds',
+    'Inference request latency',
+    labelnames=['endpoint'],
+    # Bucket boundaries for percentile computation
+    buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]
+)
+
+# Gauge: current value (can go up or down)
+BATCH_SIZE = Gauge('ml_current_batch_size', 'Current batch size being processed')
+GPU_MEMORY = Gauge('ml_gpu_memory_bytes', 'Current GPU memory usage')
+
+# ── Instrument the predict endpoint ──────────────────────────────────────────
+import functools
 import time
 
-# Metrics
-REQUEST_COUNT = Counter(
-    "inference_requests_total",
-    "Total inference requests",
-    labelnames=["status", "model_version"],
-)
-LATENCY = Histogram(
-    "inference_latency_seconds",
-    "Request latency in seconds",
-    labelnames=["model_version"],
-    buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
-)
-BATCH_SIZE = Histogram(
-    "inference_batch_size",
-    "Batch size per request",
-    buckets=[1, 2, 4, 8, 16, 32, 64],
-)
-GPU_MEMORY = Gauge("gpu_memory_allocated_bytes", "GPU memory allocated", labelnames=["device"])
+def track_metrics(endpoint_name: str):
+    """Decorator to automatically track request metrics"""
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            REQUEST_COUNT.labels(endpoint=endpoint_name, status='started').inc()
+            start = time.perf_counter()
+            
+            try:
+                result = await func(*args, **kwargs)
+                REQUEST_COUNT.labels(endpoint=endpoint_name, status='success').inc()
+                return result
+            except Exception as e:
+                REQUEST_COUNT.labels(endpoint=endpoint_name, status='error').inc()
+                raise
+            finally:
+                latency = time.perf_counter() - start
+                REQUEST_LATENCY.labels(endpoint=endpoint_name).observe(latency)
+                
+                # Update GPU memory gauge
+                if torch.cuda.is_available():
+                    GPU_MEMORY.set(torch.cuda.memory_allocated())
+        
+        return wrapper
+    return decorator
 
+# Apply to endpoint:
+@app.post("/predict")
+@track_metrics("predict")
+async def predict(request: PredictRequest):
+    ...  # Same as before
 
-def record_inference(batch_size: int, latency_s: float, success: bool, version: str = "v1"):
-    status = "success" if success else "error"
-    REQUEST_COUNT.labels(status=status, model_version=version).inc()
-    LATENCY.labels(model_version=version).observe(latency_s)
-    BATCH_SIZE.observe(batch_size)
-    if torch.cuda.is_available():
-        GPU_MEMORY.labels(device="cuda:0").set(torch.cuda.memory_allocated())
-
-
-# Data drift detection
-class DriftDetector:
-    """
-    Monitors statistical properties of incoming data.
-    Alerts when distribution drifts from training baseline.
-    """
-
-    def __init__(self, baseline_stats: dict, threshold: float = 0.1):
-        self.baseline = baseline_stats  # {"mean": [...], "std": [...]}
-        self.threshold = threshold
-        self.buffer = []
-        self.buffer_size = 1000
-
-    def observe(self, x: torch.Tensor):
-        self.buffer.append(x.detach().cpu())
-        if len(self.buffer) >= self.buffer_size:
-            self._check_drift()
-            self.buffer.clear()
-
-    def _check_drift(self):
-        data = torch.stack(self.buffer)
-        curr_mean = data.mean(0).numpy()
-        baseline_mean = self.baseline["mean"]
-
-        rel_drift = abs(curr_mean - baseline_mean) / (abs(baseline_mean) + 1e-8)
-        if rel_drift.max() > self.threshold:
-            print(f"ALERT: Data drift detected! Max relative drift: {rel_drift.max():.3f}")
-            # In production: send to PagerDuty, Slack, etc.
+# Metrics endpoint for Prometheus scraping
+@app.get("/metrics")
+async def metrics():
+    """Prometheus scrapes this endpoint every 15 seconds"""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 ```
 
 ---
 
-## 14.8 A/B Testing Models
+## Part 6: A/B Testing Model Versions
 
 ```python
 import random
-from typing import Callable
-import torch
+from enum import Enum
 
-class ABTestRouter:
+class ModelVersion(str, Enum):
+    V1 = "v1"  # Current production model (stable)
+    V2 = "v2"  # New candidate model (under test)
+
+class ABTestingRouter:
     """
-    Routes a fraction of traffic to a canary (new) model.
-    Records outcomes for statistical comparison.
+    Routes requests between model versions based on traffic split.
+    
+    Example: 90% → v1 (stable), 10% → v2 (candidate)
+    
+    For statistical significance with 10% traffic split:
+    - Need ~1000 requests to see 1% accuracy difference
+    - Use proper statistical test (z-test for proportions)
     """
-
-    def __init__(
-        self,
-        control_model: torch.nn.Module,  # current production model
-        canary_model: torch.nn.Module,   # new model being tested
-        canary_fraction: float = 0.1,    # 10% traffic to canary
-    ):
-        self.control = control_model
-        self.canary  = canary_model
-        self.canary_fraction = canary_fraction
-        self.control_results = []
-        self.canary_results  = []
-
-    def predict(self, x: torch.Tensor, ground_truth=None) -> tuple:
-        use_canary = random.random() < self.canary_fraction
-        model_name = "canary" if use_canary else "control"
-        model      = self.canary if use_canary else self.control
-
-        with torch.inference_mode():
-            output = model(x)
-
-        if ground_truth is not None:
-            result = (output.argmax(-1) == ground_truth).float().mean().item()
-            if use_canary:
-                self.canary_results.append(result)
-            else:
-                self.control_results.append(result)
-
-        return output, model_name
-
-    def report(self) -> dict:
-        if not self.control_results or not self.canary_results:
-            return {"status": "insufficient_data"}
-
-        ctrl_acc   = sum(self.control_results) / len(self.control_results)
-        canary_acc = sum(self.canary_results)  / len(self.canary_results)
-        return {
-            "control_accuracy":      ctrl_acc,
-            "canary_accuracy":       canary_acc,
-            "delta":                 canary_acc - ctrl_acc,
-            "control_samples":       len(self.control_results),
-            "canary_samples":        len(self.canary_results),
-            "recommendation":        "promote" if canary_acc > ctrl_acc + 0.005 else "hold",
+    
+    def __init__(self, model_v1: ModelInference, model_v2: ModelInference,
+                 v2_traffic_pct: float = 0.10):
+        self.models = {
+            ModelVersion.V1: model_v1,
+            ModelVersion.V2: model_v2,
         }
+        self.v2_traffic_pct = v2_traffic_pct
+        self.results = {v: {'correct': 0, 'total': 0} for v in ModelVersion}
+    
+    def route_request(self) -> ModelVersion:
+        """Random routing based on traffic split"""
+        if random.random() < self.v2_traffic_pct:
+            return ModelVersion.V2
+        return ModelVersion.V1
+    
+    async def predict(self, x: torch.Tensor,
+                      true_label: int = None) -> dict:
+        version = self.route_request()
+        model = self.models[version]
+        
+        logits = await model.predict(x)
+        pred = logits.argmax(dim=-1).item()
+        
+        # Track accuracy if ground truth available (shadow mode)
+        if true_label is not None:
+            self.results[version]['total'] += 1
+            if pred == true_label:
+                self.results[version]['correct'] += 1
+        
+        return {
+            'prediction': pred,
+            'model_version': version.value,
+        }
+    
+    def get_stats(self) -> dict:
+        """Compare model versions statistically"""
+        stats = {}
+        for version, counts in self.results.items():
+            if counts['total'] > 0:
+                accuracy = counts['correct'] / counts['total']
+                stats[version.value] = {
+                    'accuracy': accuracy,
+                    'n_requests': counts['total'],
+                }
+        return stats
+    
+    def should_promote_v2(self, min_requests: int = 1000,
+                           min_improvement: float = 0.005) -> bool:
+        """
+        Check if v2 should replace v1 in production.
+        Conservative threshold: >0.5% improvement with >1000 samples.
+        """
+        stats = self.get_stats()
+        if 'v1' not in stats or 'v2' not in stats:
+            return False
+        if stats['v2']['n_requests'] < min_requests:
+            return False
+        improvement = stats['v2']['accuracy'] - stats['v1']['accuracy']
+        return improvement >= min_improvement
 ```
 
 ---
 
-## Exercises
+## Key Takeaways
 
-**Exercise 14.1** Build a complete image classification serving API using FastAPI + TorchScript (ResNet-50, ImageNet). Add: input validation (image size, channels), preprocessing, top-5 class names in response, and Prometheus metrics.
-
-**Exercise 14.2** Implement request-level caching using an LRU cache keyed on input tensor hash. Measure hit rate and latency improvement for repeated requests.
-
-**Exercise 14.3** Write a Kubernetes deployment manifest for the inference server with: GPU node selector, HPA based on GPU memory utilisation (custom metrics via DCGM), and a PodDisruptionBudget ensuring at least 1 pod is always running.
-
----
-
-## Module Summary
-
-| Component | Technology | Purpose |
-|-----------|----------|--------|
-| REST API | FastAPI + uvicorn | Single-model HTTP inference |
-| Multi-model server | TorchServe | Production multi-model, batching, versioning |
-| Dynamic batching | asyncio Queue | GPU utilisation for async servers |
-| Container | Docker (nvidia runtime) | Reproducible, portable deployment |
-| Orchestration | Kubernetes + HPA | Scaling, HA, rolling updates |
-| Monitoring | Prometheus + Grafana | Latency, throughput, drift |
-| A/B testing | Custom router | Safe canary rollouts |
+| Component | Purpose | Key Decision |
+|-----------|---------|-------------|
+| **FastAPI + asyncio** | Handle concurrent requests | workers=1 for GPU servers |
+| **Dynamic Batching** | Maximize GPU utilization | Tune max_wait_ms vs max_batch_size |
+| **Docker** | Reproducible deployment | Non-root user, health checks |
+| **Prometheus** | Observability | Track latency p50/p95/p99 |
+| **A/B Testing** | Safe model updates | 10% traffic → collect stats → decide |
 
 ---
 
 ## Quiz
 
-1. Why must you warm up the model before serving real traffic?
-2. What is dynamic batching and why does it improve GPU utilisation?
-3. What is the difference between readiness and liveness probes in Kubernetes?
-4. How does A/B testing differ from canary deployment?
-5. What does `asyncio.Lock()` protect in the inference server?
-6. Why use `workers=1` in uvicorn for GPU inference servers?
-7. What is data drift and how would you detect it in production?
+1. **Why use `workers=1` for GPU inference servers?**
+   - Answer: Multiple uvicorn workers create separate processes each loading the model into GPU memory, causing OOM
 
----
+2. **What is dynamic batching and why does it improve throughput?**
+   - Answer: Groups multiple individual requests into one GPU batch; GPUs are efficient with larger batches; amortizes kernel launch overhead
 
-*Next: [Module 15 — Evaluation & Model Interpretability](./15_evaluation_and_interpretability.md)*
+3. **What does `asyncio.Lock()` protect in the inference server?**
+   - Answer: Prevents concurrent GPU access from multiple async handlers; prevents race conditions and memory errors
+
+4. **What is the role of the `/health` endpoint?**
+   - Answer: Kubernetes liveness/readiness probe; returns 200 only when model is loaded and ready
+
+5. **What is a Prometheus Counter vs Gauge vs Histogram?**
+   - Answer: Counter: only increases (requests, errors); Gauge: current value (memory, connections); Histogram: distribution for percentiles
+
+6. **Why should production Docker containers run as non-root?**
+   - Answer: Security principle of least privilege; limits damage if container is compromised
+
+7. **What is multi-stage Docker build?**
+   - Answer: Uses a builder image for compilation, copies only artifacts to slim runtime image; reduces production image size
+
+8. **What is the p95 latency metric?**
+   - Answer: 95th percentile — 95% of requests are faster than this; better than average for catching tail latency
+
+9. **How does A/B testing differ from a canary deployment?**
+   - Answer: A/B: fixed traffic split for statistical comparison; Canary: gradually increase traffic % while monitoring for regressions
+
+10. **Why use pydantic models for request/response?**
+    - Answer: Automatic validation, type coercion, clear error messages, and auto-generated OpenAPI documentation

@@ -1,529 +1,487 @@
-# Module 07: Recurrent Networks & Sequence Models
+# Module 07: Recurrent Networks & Sequences — Learning from Order
+
+> **Goal:** Understand recurrent neural networks from first principles — why they exist, how LSTMs solve the vanishing gradient problem, and when to use them vs transformers.
+
+---
 
 ## Learning Objectives
-By the end of this module you will be able to:
-- Explain the vanishing gradient problem in vanilla RNNs and how LSTMs solve it
-- Implement RNN, LSTM, and GRU from scratch and using nn.RNN/LSTM/GRU
-- Build sequence-to-sequence models with encoder-decoder architectures
-- Handle variable-length sequences with padding and packing
-- Apply teacher forcing and scheduled sampling for sequence generation
-- Build character-level and word-level language models
-- Implement bidirectional and stacked (multi-layer) RNNs correctly
+
+By the end of this module, you will:
+- **Understand** why sequential data needs special architectures
+- **Implement** a vanilla RNN from scratch to see how state flows
+- **Grasp** the LSTM cell gates mathematically and intuitively
+- **Handle** variable-length sequences with padding and packing
+- **Build** a BiLSTM text classifier and a Seq2Seq model
+- **Know** when RNNs are appropriate vs when to use Transformers
 
 ---
 
-## 7.1 The Recurrence Equation
+## Part 1: The Sequence Problem
 
-A **Recurrent Neural Network** processes a sequence x₁, x₂, ..., xₜ one step at a time, maintaining a hidden state hₜ that carries information from previous steps:
+### 1.1 Why Feedforward Networks Fail on Sequences
+
+A feedforward network takes a fixed-size input and produces a fixed-size output. For sequences, we need to:
+1. Process inputs of **variable length** (sentences can be 3 or 300 words)
+2. Maintain **order sensitivity** ("dog bites man" ≠ "man bites dog")
+3. Capture **long-range dependencies** ("The cat, which was sitting by the window, **was** hungry")
+
+### 1.2 The Core RNN Idea: Hidden State
+
+An RNN processes sequences one step at a time, passing a **hidden state** from step to step. The hidden state is the network's "memory."
 
 ```
-hₜ = tanh(W_hh · h_{t-1} + W_xh · xₜ + b_h)
-yₜ = W_hy · hₜ + b_y
+Input:   x₁  →  x₂  →  x₃  →  ...  → xₜ
+          ↓       ↓       ↓             ↓
+h₀  →  [RNN] → [RNN] → [RNN] → ... → [RNN] → hₜ → output
+         h₁      h₂      h₃            hₜ
 ```
 
-**Backpropagation Through Time (BPTT):**
-
-Gradients flow backward through all T timesteps:
-```
-∂L/∂W_hh = Σ_{t=1}^{T} ∂Lₜ/∂W_hh
-```
-
-The chain rule produces factors of `W_hh^T` in the gradient — if eigenvalues of `W_hh` < 1: **vanishing gradients**; if > 1: **exploding gradients**.
+At each step: `hₜ = tanh(W_hh · h_{t-1} + W_xh · xₜ + b)`
 
 ---
 
-## 7.2 Vanilla RNN in PyTorch
+## Part 2: Vanilla RNN from Scratch
 
 ```python
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ── Manual RNN cell ──────────────────────────────────────────────────────────
-class RNNCell(nn.Module):
-    """Single RNN step: hₜ = tanh(x_t @ W_xh.T + h_{t-1} @ W_hh.T + b)"""
-
+class VanillaRNNCell(nn.Module):
+    """
+    Single RNN step: takes one input and previous hidden state,
+    produces new hidden state.
+    
+    Math: h_t = tanh(W_xh @ x_t + W_hh @ h_{t-1} + b)
+    
+    W_xh: input → hidden (how much does input affect memory?)
+    W_hh: hidden → hidden (how much does memory affect itself?)
+    """
     def __init__(self, input_size: int, hidden_size: int):
         super().__init__()
-        self.W_xh = nn.Linear(input_size,  hidden_size, bias=True)
-        self.W_hh = nn.Linear(hidden_size, hidden_size, bias=False)
-
+        # Combined weight matrix: [W_xh | W_hh] applied to [x_t; h_{t-1}]
+        # This is mathematically equivalent but computed in one operation
+        self.linear = nn.Linear(input_size + hidden_size, hidden_size)
+    
     def forward(self, x_t: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
-        return torch.tanh(self.W_xh(x_t) + self.W_hh(h_prev))
+        """
+        x_t:   (batch, input_size)  — current input token
+        h_prev: (batch, hidden_size) — previous hidden state
+        
+        Returns h_t: (batch, hidden_size)
+        """
+        # Concatenate input and hidden state
+        combined = torch.cat([x_t, h_prev], dim=-1)  # (batch, input+hidden)
+        # Apply linear + tanh activation
+        h_t = torch.tanh(self.linear(combined))
+        return h_t
 
 
-class ManualRNN(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, output_size: int):
+class VanillaRNN(nn.Module):
+    """Full RNN that processes an entire sequence"""
+    
+    def __init__(self, input_size: int, hidden_size: int):
         super().__init__()
         self.hidden_size = hidden_size
-        self.cell = RNNCell(input_size, hidden_size)
-        self.fc   = nn.Linear(hidden_size, output_size)
-
+        self.cell = VanillaRNNCell(input_size, hidden_size)
+    
     def forward(self, x: torch.Tensor) -> tuple:
         """
         x: (batch, seq_len, input_size)
-        returns: (outputs, final_hidden)
+        Returns: (all_hidden, last_hidden)
+            all_hidden: (batch, seq_len, hidden_size) — all time steps
+            last_hidden: (batch, hidden_size) — final hidden state
         """
-        batch, T, _ = x.shape
-        h = torch.zeros(batch, self.hidden_size, device=x.device)
-        outputs = []
-        for t in range(T):
-            h = self.cell(x[:, t, :], h)
-            outputs.append(h)
-        outputs = torch.stack(outputs, dim=1)   # (batch, T, hidden)
-        return self.fc(outputs), h
+        batch_size, seq_len, _ = x.shape
+        
+        # Initialize hidden state to zeros
+        h = torch.zeros(batch_size, self.hidden_size, device=x.device)
+        
+        all_hidden = []
+        for t in range(seq_len):
+            x_t = x[:, t, :]         # (batch, input_size) — t-th input
+            h = self.cell(x_t, h)    # (batch, hidden_size) — new hidden state
+            all_hidden.append(h)
+        
+        # Stack all hidden states along time dimension
+        all_hidden = torch.stack(all_hidden, dim=1)  # (batch, seq_len, hidden)
+        
+        return all_hidden, h  # Return all states AND final state
 
+# Test
+rnn = VanillaRNN(input_size=10, hidden_size=32)
+x = torch.randn(8, 20, 10)   # batch=8, seq_len=20, features=10
+all_h, last_h = rnn(x)
+print(f"All hidden: {all_h.shape}")   # (8, 20, 32)
+print(f"Last hidden: {last_h.shape}") # (8, 32)
+```
 
-# ── PyTorch built-in RNN ─────────────────────────────────────────────────────
-rnn = nn.RNN(
-    input_size=10,
-    hidden_size=32,
-    num_layers=2,        # stacked RNN
-    batch_first=True,    # (batch, seq, feature) — preferred
-    dropout=0.3,         # applied between layers (not after last layer)
-    bidirectional=False,
-    nonlinearity="tanh", # 'tanh' or 'relu'
-)
+### 2.1 The Vanishing Gradient Problem in RNNs
 
-x = torch.randn(8, 20, 10)  # (batch=8, seq=20, features=10)
-output, h_n = rnn(x)
-# output: (8, 20, 32) — all hidden states
-# h_n:   (num_layers, 8, 32) — final hidden state per layer
+```python
+# Why vanilla RNNs struggle with long sequences
+# 
+# During backpropagation through time (BPTT):
+# gradient at step t = ∏ₜ (W_hh * tanh'(z_t))
+#
+# If tanh'(z) ≈ 0.5 and |W_hh| < 2 (common):
+# gradient after 100 steps ≈ 0.5^100 ≈ 10^-30 → VANISHED!
+#
+# If |W_hh| > 2:
+# gradient after 100 steps → ∞ → EXPLODED!
+
+def demonstrate_vanishing_gradient():
+    """Show how gradients vanish over time in vanilla RNN"""
+    input_size, hidden_size, seq_len = 10, 32, 50
+    rnn = VanillaRNN(input_size, hidden_size)
+    x = torch.randn(1, seq_len, input_size)
+    
+    all_h, last_h = rnn(x)
+    loss = last_h.sum()
+    loss.backward()
+    
+    # Gradient of FIRST input should capture long-range dependency
+    # In practice, it's nearly zero
+    first_input_grad = x.grad
+    if first_input_grad is not None:
+        grad_norm = first_input_grad.norm()
+        print(f"Gradient norm at step 0 (seq_len={seq_len}): {grad_norm:.6f}")
+        # Expected: very small for long sequences
 ```
 
 ---
 
-## 7.3 LSTM: Long Short-Term Memory
+## Part 3: LSTM — Long Short-Term Memory
 
-The LSTM solves the vanishing gradient problem by introducing a **cell state** cₜ that flows through time with minimal perturbation (via additive updates rather than multiplicative).
+### 3.1 The LSTM Solution: Separate Cell State
 
-**LSTM equations:**
+The LSTM introduces a **cell state** (Cₜ) — a "conveyor belt" that runs through the sequence with only minor, controlled modifications. Information can flow largely unchanged across many timesteps.
+
 ```
-fₜ = σ(W_f · [h_{t-1}, xₜ] + b_f)    ← forget gate
-iₜ = σ(W_i · [h_{t-1}, xₜ] + b_i)    ← input gate
-c̃ₜ = tanh(W_c · [h_{t-1}, xₜ] + b_c)  ← candidate cell
-cₜ = fₜ ⊙ c_{t-1} + iₜ ⊙ c̃ₜ         ← cell state update
-oₜ = σ(W_o · [h_{t-1}, xₜ] + b_o)    ← output gate
-hₜ = oₜ ⊙ tanh(cₜ)                   ← hidden state
+         h_{t-1}        x_t
+            │             │
+            └──────┬───────┘
+                   │
+          ┌────────┴────────┐
+          │    Gate Logic    │
+          │  ┌─────────────┐│
+          │  │ Forget Gate ││  ← "What from memory to erase?"
+          │  │  fₜ = σ(...)││
+          │  └──────┬──────┘│
+     ┌────┤         │       ├────┐
+     │    │  ┌──────┤       │   │
+C_{t-1}─(×)─┤  ┌─────────┐│   (×)─→ C_t ─→ (tanh) ─→ hₜ
+             │  │ Input G.││             ↑
+             │  │  iₜ=σ(..)│         (×) Output Gate
+             │  │  g̃ₜ=tanh││         oₜ = σ(...)
+             │  │ (iₜ * g̃ₜ)│
+             │  └─────────┘│
+             └─────────────┘
 ```
 
-Key insight: the cell state gradient has a "highway" through `fₜ` (forget gate), which can be ≈1, allowing gradients to flow hundreds of steps back.
+### 3.2 LSTM Equations Explained
 
 ```python
-# ── Manual LSTM cell ─────────────────────────────────────────────────────────
 class LSTMCell(nn.Module):
+    """
+    LSTM cell implementing the full gating mechanism.
+    
+    Gates (all use sigmoid — output in [0,1]):
+    - Forget gate fₜ:  "What fraction of old memory to keep?" (0=forget, 1=keep)
+    - Input gate iₜ:   "How much of new info to write?"
+    - Output gate oₜ:  "What to read out from memory to hidden state?"
+    
+    Candidate:
+    - g̃ₜ (tanh): "What new information to potentially write?"
+    
+    Cell state update:
+    Cₜ = fₜ ⊙ C_{t-1} + iₜ ⊙ g̃ₜ
+         ─────────────   ──────────
+         keep fraction   add fraction of new info
+    
+    Hidden state:
+    hₜ = oₜ ⊙ tanh(Cₜ)   ← output gate controls what to expose
+    """
+    
     def __init__(self, input_size: int, hidden_size: int):
         super().__init__()
-        # Combined gate matrix: [W_f, W_i, W_c, W_o] stacked
-        # More efficient than 4 separate linears
+        self.hidden_size = hidden_size
+        
+        # One combined linear layer for efficiency
+        # Projects [xₜ, h_{t-1}] → [fₜ, iₜ, g̃ₜ, oₜ] (4 × hidden)
         self.gates = nn.Linear(input_size + hidden_size, 4 * hidden_size)
-
-    def forward(
-        self, x_t: torch.Tensor, h_prev: torch.Tensor, c_prev: torch.Tensor
-    ) -> tuple:
-        combined = torch.cat([x_t, h_prev], dim=-1)   # (batch, input+hidden)
-        raw      = self.gates(combined)                # (batch, 4*hidden)
-
-        # Split into 4 gate activations
-        f, i, c_tilde, o = raw.chunk(4, dim=-1)
-
-        f       = torch.sigmoid(f)
-        i       = torch.sigmoid(i)
-        c_tilde = torch.tanh(c_tilde)
-        o       = torch.sigmoid(o)
-
-        c_t = f * c_prev + i * c_tilde    # cell update (additive!)
+    
+    def forward(self, x_t, h_prev, c_prev):
+        """
+        x_t:    (batch, input_size)
+        h_prev: (batch, hidden_size)
+        c_prev: (batch, hidden_size)
+        """
+        # Concatenate input and previous hidden state
+        combined = torch.cat([x_t, h_prev], dim=1)  # (batch, input+hidden)
+        
+        # Compute all 4 gates at once (more efficient)
+        gates = self.gates(combined)  # (batch, 4*hidden)
+        
+        # Split into individual gates
+        f, i, g, o = gates.chunk(4, dim=1)  # Each: (batch, hidden)
+        
+        # Apply activations
+        f = torch.sigmoid(f)   # Forget gate: [0,1]
+        i = torch.sigmoid(i)   # Input gate:  [0,1]
+        g = torch.tanh(g)      # Candidate:   [-1,1]
+        o = torch.sigmoid(o)   # Output gate: [0,1]
+        
+        # Update cell state: keep some of old, add some of new
+        c_t = f * c_prev + i * g  # Element-wise multiplication
+        
+        # Compute hidden state: gated output of cell state
         h_t = o * torch.tanh(c_t)
+        
         return h_t, c_t
 
 
-# ── PyTorch built-in LSTM ─────────────────────────────────────────────────────
-lstm = nn.LSTM(
-    input_size=64,
-    hidden_size=256,
-    num_layers=2,
-    batch_first=True,
-    dropout=0.3,
-    bidirectional=True,
-)
+class LSTM(nn.Module):
+    """Multi-step LSTM that processes full sequences"""
+    
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1,
+                 dropout: float = 0.0, bidirectional: bool = False):
+        super().__init__()
+        self.hidden_size = hidden_size
+        # Use PyTorch's built-in LSTM (optimized with cuDNN)
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,       # input: (batch, seq, features) instead of (seq, batch, features)
+            dropout=dropout if num_layers > 1 else 0,  # Dropout between layers
+            bidirectional=bidirectional
+        )
+        # If bidirectional, hidden size is doubled (forward + backward)
+        self.out_size = hidden_size * 2 if bidirectional else hidden_size
+    
+    def forward(self, x: torch.Tensor, lengths=None):
+        """
+        x:       (batch, seq_len, input_size)
+        lengths: optional tensor of actual sequence lengths (for packing)
+        Returns: (output, (h_n, c_n))
+            output: (batch, seq_len, out_size) — hidden states at each step
+            h_n:    (num_layers, batch, out_size) — final hidden state
+            c_n:    (num_layers, batch, out_size) — final cell state
+        """
+        output, (h_n, c_n) = self.lstm(x)
+        return output, (h_n, c_n)
 
-x = torch.randn(32, 50, 64)   # (batch=32, seq=50, features=64)
+# Test LSTM
+lstm = LSTM(input_size=50, hidden_size=128, num_layers=2,
+            dropout=0.3, bidirectional=True)
+x = torch.randn(16, 30, 50)  # batch=16, seq_len=30, embed_dim=50
 output, (h_n, c_n) = lstm(x)
-# output: (32, 50, 512)   — 256 * 2 (bidirectional)
-# h_n:   (4,  32, 256)    — 2 layers * 2 directions
-# c_n:   (4,  32, 256)
-
-# For classification using the last hidden state:
-# Concatenate forward and backward final states
-final_hidden = torch.cat([h_n[-2], h_n[-1]], dim=-1)  # (32, 512)
+print(f"Output: {output.shape}")   # (16, 30, 256) — 128*2 for bidirectional
+print(f"h_n: {h_n.shape}")        # (4, 16, 128) — 2 layers * 2 directions
 ```
 
----
-
-## 7.4 GRU: Gated Recurrent Unit
-
-Simpler than LSTM (no cell state), nearly as effective, faster to train:
-
-```
-zₜ = σ(W_z · [h_{t-1}, xₜ])          ← update gate
-rₜ = σ(W_r · [h_{t-1}, xₜ])          ← reset gate
-h̃ₜ = tanh(W · [rₜ ⊙ h_{t-1}, xₜ])    ← candidate hidden
-hₜ = (1 - zₜ) ⊙ h_{t-1} + zₜ ⊙ h̃ₜ   ← hidden update
-```
+### 3.3 GRU — Simplified LSTM
 
 ```python
-gru = nn.GRU(input_size=64, hidden_size=256, num_layers=2,
-             batch_first=True, dropout=0.3, bidirectional=False)
+# GRU (Gated Recurrent Unit) — Simpler than LSTM, often comparable performance
+# 
+# Key difference: No separate cell state! Only hidden state.
+# Uses only 2 gates instead of 3:
+# - Reset gate rₜ: "How much past to consider for candidate?"
+# - Update gate zₜ: "How much new vs old hidden state to use?"
+#
+# h̃ₜ = tanh(Wxh*xₜ + rₜ ⊙ (Whh*h_{t-1}))   ← candidate
+# hₜ = (1-zₜ) ⊙ h_{t-1} + zₜ ⊙ h̃ₜ        ← final update
+#
+# When zₜ → 0: hₜ → h_{t-1} (keep old state)
+# When zₜ → 1: hₜ → h̃ₜ (full update)
 
-x = torch.randn(32, 50, 64)
-output, h_n = gru(x)
-# output: (32, 50, 256)
-# h_n:   (2, 32, 256)
+# Built-in nn.GRU is optimized and easy to use
+gru = nn.GRU(input_size=50, hidden_size=128, num_layers=2,
+             batch_first=True, dropout=0.3, bidirectional=True)
+x = torch.randn(16, 30, 50)
+output, h_n = gru(x)   # GRU returns (output, h_n) — no c_n!
+print(f"GRU output: {output.shape}")  # (16, 30, 256)
+print(f"GRU h_n: {h_n.shape}")       # (4, 16, 128)
+
+# GRU vs LSTM:
+# GRU: fewer parameters (2 gates vs 3), faster to train
+# LSTM: more expressive, slightly better on long dependencies
+# In practice: try GRU first, use LSTM if more capacity needed
 ```
-
-### RNN vs GRU vs LSTM: When to Use Which
-
-| Model | Parameters | Speed | Memory | Best For |
-|-------|-----------|-------|--------|---------|
-| RNN | Fewest | Fastest | Least | Short sequences (< 20 tokens) |
-| GRU | Medium | Fast | Less | Medium sequences; resource-limited |
-| LSTM | Most | Slower | More | Long sequences; standard NLP |
 
 ---
 
-## 7.5 Variable-Length Sequences: Padding & Packing
+## Part 4: Handling Variable-Length Sequences
 
-Real sequences have variable lengths. PyTorch's `pack_padded_sequence` avoids computing on padding tokens — critical for training efficiency and correct gradients.
+### 4.1 Padding and Packing
 
 ```python
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 
-# ── Padding a batch of sequences ──────────────────────────────────────────────
+# Problem: sequences in a batch have different lengths
+# Solution: pad shorter sequences with zeros, pack for efficiency
+
 sequences = [
-    torch.randn(5, 64),   # seq_len=5
-    torch.randn(3, 64),   # seq_len=3
-    torch.randn(7, 64),   # seq_len=7
+    torch.randn(5, 10),  # seq_len=5
+    torch.randn(8, 10),  # seq_len=8
+    torch.randn(3, 10),  # seq_len=3
 ]
-# Sort by length descending (required for pack_padded_sequence)
-sequences.sort(key=lambda x: x.shape[0], reverse=True)
-lengths = torch.tensor([s.shape[0] for s in sequences])
 
+# Pad to same length (max_length=8)
 padded = pad_sequence(sequences, batch_first=True, padding_value=0.0)
-# shape: (batch=3, max_len=7, features=64)
+print(f"Padded shape: {padded.shape}")  # (3, 8, 10) — 3 seqs, max_len=8, features=10
 
-# ── Pack → LSTM → Unpack ──────────────────────────────────────────────────────
-packed = pack_padded_sequence(padded, lengths, batch_first=True, enforce_sorted=True)
+# Record original lengths
+lengths = torch.tensor([5, 8, 3])
 
-lstm = nn.LSTM(input_size=64, hidden_size=128, batch_first=True)
-packed_output, (h_n, c_n) = lstm(packed)
+# Pack: removes padding, tells LSTM where sequences end
+# IMPORTANT: sequences must be sorted by length (descending) before packing!
+sorted_lengths, sort_idx = lengths.sort(descending=True)
+padded_sorted = padded[sort_idx]
 
-output, output_lengths = pad_packed_sequence(packed_output, batch_first=True)
-# output: (batch, max_len, hidden) — padding zeros restored
+packed = pack_padded_sequence(padded_sorted, sorted_lengths.cpu(), batch_first=True)
 
-# ── Alternative: use padding_mask in attention (for transformers) ─────────────
-# Many modern implementations just use attention masks instead of packing
+# Run through LSTM (avoids computing on padding → faster + correct!)
+lstm = nn.LSTM(input_size=10, hidden_size=32, batch_first=True)
+output_packed, (h_n, c_n) = lstm(packed)
+
+# Unpack back to padded format
+output_padded, output_lengths = pad_packed_sequence(output_packed, batch_first=True)
+print(f"Output shape: {output_padded.shape}")  # (3, 8, 32) — padded back
 ```
 
 ---
 
-## 7.6 Language Model: Character-Level
+## Part 5: Text Classification with BiLSTM
 
 ```python
-import torch
-import torch.nn as nn
-from typing import Tuple
-
-class CharLM(nn.Module):
+class TextClassifier(nn.Module):
     """
-    Character-level language model.
-    Input: (batch, seq_len) integer character IDs
-    Output: (batch, seq_len, vocab_size) logits
+    Bidirectional LSTM for sentiment/topic classification.
+    
+    Architecture:
+    Input tokens → Embedding → BiLSTM → Pooling → Classifier
+    
+    Why bidirectional? Captures context from BOTH directions:
+    "The movie was NOT good" — "NOT" affects "good" which comes after
     """
-
-    def __init__(self, vocab_size: int, embed_dim: int, hidden_size: int, n_layers: int, dropout: float = 0.3):
+    
+    def __init__(self, vocab_size: int, embed_dim: int, hidden_size: int,
+                 n_classes: int, n_layers: int = 2, dropout: float = 0.3,
+                 pad_idx: int = 0):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.lstm      = nn.LSTM(
-            embed_dim, hidden_size, num_layers=n_layers,
-            batch_first=True, dropout=dropout if n_layers > 1 else 0,
-        )
-        self.drop   = nn.Dropout(dropout)
-        self.fc     = nn.Linear(hidden_size, vocab_size)
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.uniform_(self.embedding.weight, -0.1, 0.1)
-        for name, param in self.lstm.named_parameters():
-            if "weight" in name:
-                nn.init.orthogonal_(param)
-            elif "bias" in name:
-                nn.init.zeros_(param)
-
-    def forward(
-        self, x: torch.Tensor, hidden: Tuple = None
-    ) -> Tuple[torch.Tensor, Tuple]:
-        emb    = self.drop(self.embedding(x))       # (B, T, E)
-        out, hidden = self.lstm(emb, hidden)        # (B, T, H)
-        logits = self.fc(self.drop(out))            # (B, T, V)
-        return logits, hidden
-
-    def init_hidden(self, batch_size: int, device: torch.device) -> Tuple:
-        h = torch.zeros(self.lstm.num_layers, batch_size, self.lstm.hidden_size, device=device)
-        c = torch.zeros(self.lstm.num_layers, batch_size, self.lstm.hidden_size, device=device)
-        return h, c
-
-    @torch.no_grad()
-    def generate(
-        self, start_token: int, max_len: int = 200, temperature: float = 1.0, device: str = "cpu"
-    ) -> list:
-        """Autoregressive generation with temperature sampling."""
-        self.eval()
-        x = torch.tensor([[start_token]], device=device)
-        hidden = self.init_hidden(1, device)
-        generated = [start_token]
-
-        for _ in range(max_len):
-            logits, hidden = self(x, hidden)       # (1, 1, V)
-            logits = logits[:, -1, :] / temperature
-            probs  = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, 1).item()
-            generated.append(next_token)
-            x = torch.tensor([[next_token]], device=device)
-
-        return generated
-
-
-# Training with truncated BPTT
-def train_lm_epoch(model, loader, optimizer, criterion, device, bptt_len=35):
-    model.train()
-    total_loss = 0
-    hidden = model.init_hidden(loader.dataset.batch_size, device)
-
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        # Detach hidden to prevent backprop into previous chunks
-        hidden = tuple(h.detach() for h in hidden)
-
-        optimizer.zero_grad()
-        logits, hidden = model(x, hidden)
-        loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.25)
-        optimizer.step()
-        total_loss += loss.item()
-
-    return total_loss / len(loader)
-```
-
----
-
-## 7.7 Sequence-to-Sequence with Encoder-Decoder
-
-```python
-class Encoder(nn.Module):
-    def __init__(self, vocab_size: int, embed_dim: int, hidden_size: int, n_layers: int, dropout: float):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.lstm      = nn.LSTM(embed_dim, hidden_size, n_layers, batch_first=True, dropout=dropout)
-        self.dropout   = nn.Dropout(dropout)
-
-    def forward(self, src: torch.Tensor) -> Tuple:
-        """src: (batch, src_len) → context: (h_n, c_n)"""
-        emb = self.dropout(self.embedding(src))
-        _, (h_n, c_n) = self.lstm(emb)
-        return h_n, c_n
-
-
-class Decoder(nn.Module):
-    def __init__(self, vocab_size: int, embed_dim: int, hidden_size: int, n_layers: int, dropout: float):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.lstm      = nn.LSTM(embed_dim, hidden_size, n_layers, batch_first=True, dropout=dropout)
-        self.fc        = nn.Linear(hidden_size, vocab_size)
-        self.dropout   = nn.Dropout(dropout)
-
-    def forward(self, tgt_token: torch.Tensor, hidden: Tuple) -> Tuple:
-        """tgt_token: (batch,) → logits: (batch, vocab), hidden"""
-        emb    = self.dropout(self.embedding(tgt_token.unsqueeze(1)))  # (B, 1, E)
-        out, hidden = self.lstm(emb, hidden)                           # (B, 1, H)
-        logits = self.fc(out.squeeze(1))                               # (B, V)
-        return logits, hidden
-
-
-class Seq2Seq(nn.Module):
-    def __init__(self, encoder: Encoder, decoder: Decoder, pad_idx: int = 0):
-        super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.pad_idx = pad_idx
-
-    def forward(
-        self,
-        src: torch.Tensor,
-        tgt: torch.Tensor,
-        teacher_forcing_ratio: float = 0.5,
-    ) -> torch.Tensor:
-        """
-        src: (batch, src_len)
-        tgt: (batch, tgt_len)
-        Returns: logits (batch, tgt_len - 1, vocab_size)
-        """
-        batch_size, tgt_len = tgt.shape
-        vocab_size = self.decoder.fc.out_features
-
-        # Encode source
-        hidden = self.encoder(src)
-
-        # First decoder input = <BOS> token
-        dec_input  = tgt[:, 0]
-        all_logits = []
-
-        for t in range(1, tgt_len):
-            logits, hidden = self.decoder(dec_input, hidden)
-            all_logits.append(logits)
-
-            # Teacher forcing: use ground truth vs model prediction
-            use_teacher = torch.rand(1).item() < teacher_forcing_ratio
-            dec_input = tgt[:, t] if use_teacher else logits.argmax(-1)
-
-        return torch.stack(all_logits, dim=1)   # (B, tgt_len-1, V)
-
-    @torch.no_grad()
-    def generate(
-        self, src: torch.Tensor, bos_idx: int, eos_idx: int,
-        max_len: int = 100, device: str = "cpu"
-    ) -> list:
-        self.eval()
-        hidden = self.encoder(src)
-        dec_input  = torch.full((src.size(0),), bos_idx, dtype=torch.long, device=device)
-        all_preds  = []
-
-        for _ in range(max_len):
-            logits, hidden = self.decoder(dec_input, hidden)
-            preds = logits.argmax(-1)
-            all_preds.append(preds)
-            dec_input = preds
-            if (preds == eos_idx).all():
-                break
-
-        return torch.stack(all_preds, dim=1)   # (batch, out_len)
-```
-
----
-
-## 7.8 Text Classification with Bidirectional LSTM
-
-```python
-class BiLSTMClassifier(nn.Module):
-    """
-    Bidirectional LSTM for text classification.
-    Takes word indices as input, outputs class logits.
-    """
-
-    def __init__(
-        self,
-        vocab_size: int,
-        embed_dim: int = 128,
-        hidden_size: int = 256,
-        n_layers: int = 2,
-        num_classes: int = 2,
-        dropout: float = 0.3,
-        pad_idx: int = 0,
-    ):
-        super().__init__()
+        
+        # Embedding: maps token IDs to dense vectors
+        # padding_idx: zero-out embeddings for padding tokens
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
+        
+        # Bidirectional LSTM
         self.lstm = nn.LSTM(
-            embed_dim, hidden_size, n_layers,
-            batch_first=True, dropout=dropout, bidirectional=True,
+            embed_dim, hidden_size,
+            num_layers=n_layers,
+            batch_first=True,
+            dropout=dropout,
+            bidirectional=True
         )
+        
         self.dropout = nn.Dropout(dropout)
-        # 4 features: [max_pool, mean_pool, forward_final, backward_final]
+        
+        # 2*hidden because bidirectional
+        # Use mean pooling over time (captures all positions)
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_size * 4, 256),
+            nn.Linear(hidden_size * 2, hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(256, num_classes),
+            nn.Linear(hidden_size, n_classes)
         )
+    
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        """
+        x:       (batch, seq_len) — token IDs
+        lengths: (batch,) — actual lengths (before padding)
+        """
+        # Embed: (batch, seq_len) → (batch, seq_len, embed_dim)
+        embedded = self.dropout(self.embedding(x))
+        
+        # Pack for efficient computation
+        packed = pack_padded_sequence(
+            embedded, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        
+        # LSTM
+        packed_output, (h_n, c_n) = self.lstm(packed)
+        
+        # Unpack
+        output, _ = pad_packed_sequence(packed_output, batch_first=True)
+        # output: (batch, seq_len, hidden*2)
+        
+        # Pooling strategies:
+        # Option 1: Last hidden state of both directions
+        # h_n: (n_layers*2, batch, hidden) → take last layer
+        h_last = torch.cat([h_n[-2], h_n[-1]], dim=1)  # (batch, hidden*2)
+        
+        # Option 2: Mean pooling (often better)
+        # Mask out padding positions before averaging
+        mask = (x != 0).unsqueeze(-1).float()  # (batch, seq, 1)
+        h_mean = (output * mask).sum(dim=1) / mask.sum(dim=1)  # (batch, hidden*2)
+        
+        # Use mean pooling
+        return self.classifier(h_mean)
 
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor = None) -> torch.Tensor:
-        emb = self.dropout(self.embedding(x))              # (B, T, E)
-
-        if lengths is not None:
-            packed  = pack_padded_sequence(emb, lengths.cpu(), batch_first=True, enforce_sorted=False)
-            out, (h_n, _) = self.lstm(packed)
-            out, _ = pad_packed_sequence(out, batch_first=True)  # (B, T, 2H)
-        else:
-            out, (h_n, _) = self.lstm(emb)
-
-        # Pooling strategies
-        max_pool  = out.max(dim=1).values                  # (B, 2H)
-        mean_pool = out.mean(dim=1)                        # (B, 2H)
-
-        # Final states from both directions (last layer)
-        fwd_final = h_n[-2]                                # (B, H)
-        bwd_final = h_n[-1]                                # (B, H)
-
-        combined  = torch.cat([max_pool, mean_pool, fwd_final, bwd_final], dim=-1)  # (B, 4H)
-        return self.classifier(self.dropout(combined))
+# Test
+model = TextClassifier(vocab_size=10000, embed_dim=128, hidden_size=256,
+                       n_classes=2, n_layers=2, dropout=0.3)
+x = torch.randint(0, 10000, (32, 50))  # batch=32, seq_len=50
+lengths = torch.randint(20, 50, (32,))  # varying lengths
+out = model(x, lengths)
+print(f"Output: {out.shape}")  # (32, 2) — binary classification
 ```
 
 ---
 
-## 7.9 Best Practices for RNNs
+## Part 6: When RNN vs Transformer
 
-| Practice | Why |
-|----------|-----|
-| Use LSTM/GRU over vanilla RNN | Vanishing gradients are fatal for sequences > 20 steps |
-| `batch_first=True` | Matches convention of (B, T, F); easier to work with |
-| Detach hidden state between chunks (TBPTT) | Prevents accumulating the entire sequence graph in memory |
-| Sort sequences by length (or use `enforce_sorted=False`) | Required for `pack_padded_sequence` |
-| Use bidirectional for classification; unidirectional for generation | Bidir needs full sequence; generation is causal |
-| Gradient clipping (`max_norm=0.25` for char-LM) | BPTT through many steps amplifies gradients |
-| Initialize LSTM biases: forget gate bias = 1.0 | Encourage the network to remember at the start |
-| Orthogonal init for recurrent weights | Helps preserve gradients in early training |
-
-```python
-# Forget gate bias initialisation
-def init_forget_bias(lstm: nn.LSTM):
-    for name, param in lstm.named_parameters():
-        if "bias" in name:
-            n = param.size(0)
-            # LSTM bias layout: [b_ii, b_if, b_ig, b_io]
-            # forget gate is the second quarter
-            param.data[n//4 : n//2].fill_(1.0)
-```
-
----
-
-## Exercises
-
-**Exercise 7.1** Implement a GRU from scratch (GRUCell) and verify it matches `nn.GRUCell` on the same weights. Use `gradcheck` to verify backward correctness.
-
-**Exercise 7.2** Build a character-level language model trained on Shakespeare's works. Report bits-per-character (BPC) and generate 500-character samples at temperatures 0.5, 1.0, and 1.5.
-
-**Exercise 7.3** Implement attention-enhanced Seq2Seq: add a Bahdanau attention layer (dot-product between decoder hidden state and all encoder outputs), producing a context vector at each decode step.
-
----
-
-## Module Summary
-
-| Model | Key Innovation | Equation |
-|-------|---------------|---------|
-| RNN | Hidden state | hₜ = tanh(W_xh·xₜ + W_hh·h_{t-1}) |
-| LSTM | Cell state + 3 gates | cₜ = fₜ⊙c_{t-1} + iₜ⊙c̃ₜ; hₜ = oₜ⊙tanh(cₜ) |
-| GRU | 2 gates, no cell | hₜ = (1-zₜ)⊙h_{t-1} + zₜ⊙h̃ₜ |
+| Aspect | RNN/LSTM | Transformer |
+|--------|----------|-------------|
+| **Parallelism** | Sequential (slow training) | Fully parallel (fast training) |
+| **Long-range deps** | Struggles (vanishing gradient) | Excellent (direct attention) |
+| **Memory** | O(seq_len) | O(seq_len²) — expensive for long |
+| **Best for** | Short sequences, streaming | NLP, long context |
+| **Datasets** | Works with less data | Needs more data |
+| **Use today** | Time-series, edge inference | NLP, vision, most DL tasks |
 
 ---
 
 ## Quiz
 
-1. Why does the vanilla RNN suffer from vanishing gradients but the LSTM cell state does not?
-2. What is the shape of `h_n` for a bidirectional 2-layer LSTM with batch=8, hidden=128?
-3. What is teacher forcing and what is its drawback?
-4. Why must you detach hidden states between BPTT chunks?
-5. What does `pack_padded_sequence` do internally to avoid computing on padding?
-6. What is the difference between `output` and `h_n` from `nn.LSTM`?
+1. **What problem does the LSTM cell state solve vs vanilla RNN?**
+   - Answer: The vanishing gradient problem — cell state allows gradients to flow across many timesteps nearly unchanged
 
----
+2. **What does the forget gate compute?**
+   - Answer: A value in [0,1] that controls how much of the previous cell state to keep
 
-*Next: [Module 08 — Attention Mechanisms & Transformers](./08_attention_and_transformers.md)*
+3. **Why use bidirectional LSTMs?**
+   - Answer: Captures context from both past and future positions simultaneously
+
+4. **What does `pack_padded_sequence` do?**
+   - Answer: Removes padding positions so the LSTM doesn't compute on padded tokens
+
+5. **What is `batch_first=True` in nn.LSTM?**
+   - Answer: Changes input shape from (seq, batch, features) to (batch, seq, features)
+
+6. **What is the key difference between LSTM and GRU?**
+   - Answer: GRU has no separate cell state and uses 2 gates (reset, update) instead of 3
+
+7. **What is BPTT?**
+   - Answer: Backpropagation Through Time — unrolling the RNN across time steps and computing gradients
+
+8. **Why does mean pooling often outperform using the last hidden state?**
+   - Answer: Mean pooling captures information from all positions, not just the last; more robust
+
+9. **What is the vanishing gradient problem in RNNs?**
+   - Answer: Gradients become exponentially small when backpropagating through many time steps
+
+10. **When should you choose RNN over Transformer?**
+    - Answer: Online/streaming inference, very long sequences with memory constraints, or when training data is limited

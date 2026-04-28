@@ -1,602 +1,787 @@
-# Module 03: Neural Networks with nn.Module
+# Module 03: Neural Networks with nn.Module — Building Intelligence Layer by Layer
+
+> **Goal:** Understand how neural networks are constructed in PyTorch — from individual neurons to deep architectures — and *why* each design choice matters.
+
+---
 
 ## Learning Objectives
-By the end of this module you will be able to:
-- Build any neural network architecture using `nn.Module`
-- Use all major built-in layers: Linear, Conv, Normalization, Dropout, Embedding
-- Apply activation functions correctly and understand their mathematics
-- Initialise weights using the right strategy for each activation
-- Inspect and debug network structure with `torchinfo`
-- Implement custom layers and parameterised modules
-- Use `nn.Sequential`, `nn.ModuleList`, and `nn.ModuleDict` effectively
+
+By the end of this module, you will:
+- **Understand** what a neuron is mathematically and biologically
+- **Build** neural networks using `nn.Module` the right way
+- **Use** all major built-in layers: Linear, Conv2d, BatchNorm, Dropout, etc.
+- **Choose** appropriate activation functions and understand their mathematical properties
+- **Initialize** weights properly to prevent vanishing/exploding gradients
+- **Compose** complex architectures using Sequential, ModuleList, ModuleDict
+- **Inspect** and debug models: count parameters, visualize architecture
 
 ---
 
-## 3.1 The Neuron and the Layer
+## Part 1: The Neuron — Where It All Begins
 
-A single artificial neuron computes:
+### 1.1 The Biological Inspiration
 
-```
-y = f(w · x + b)
-```
+A biological neuron:
+1. Receives signals from many inputs (dendrites)
+2. Combines them (cell body)
+3. Fires a signal if combined input exceeds a threshold (axon)
 
-where **w** ∈ ℝⁿ is a weight vector, b ∈ ℝ is a bias scalar, and f is an activation function.
-
-A **fully connected layer** (linear layer) applies this to all neurons simultaneously:
-
-```
-Y = f(XW^T + b)
-```
-
-where **X** ∈ ℝ^(B×n) (batch × input), **W** ∈ ℝ^(m×n) (output × input), **b** ∈ ℝᵐ.
-
----
-
-## 3.2 nn.Module: The Fundamental Building Block
-
-Every model, layer, and component in PyTorch inherits from `nn.Module`.
-
-**Three responsibilities of nn.Module:**
-1. Hold parameters (`nn.Parameter`) and sub-modules
-2. Define `forward()` — the computation to perform
-3. Provide utility methods: `.parameters()`, `.state_dict()`, `.to()`, `.train()`/`.eval()`
+An artificial neuron mirrors this:
+1. Takes multiple inputs x₁, x₂, ..., xₙ
+2. Computes a weighted sum: z = w₁x₁ + w₂x₂ + ... + wₙxₙ + b
+3. Applies an activation function: output = f(z)
 
 ```python
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-class SingleNeuron(nn.Module):
-    def __init__(self, in_features: int):
-        super().__init__()
-        # nn.Parameter: a tensor that is registered as a parameter
-        # automatically included in .parameters() and .state_dict()
-        self.weight = nn.Parameter(torch.randn(in_features))
-        self.bias   = nn.Parameter(torch.zeros(1))
+# A single artificial neuron (manually implemented)
+def single_neuron(x, weights, bias):
+    """
+    x: input vector, shape (n_inputs,)
+    weights: learned weights, shape (n_inputs,)
+    bias: learned bias, scalar
+    
+    Returns scalar output after activation
+    """
+    # Step 1: weighted sum (linear combination)
+    # This measures "how aligned" the input is with the learned weights
+    z = torch.dot(weights, x) + bias  # z = Σ(wᵢxᵢ) + b
+    
+    # Step 2: activation function (introduces non-linearity)
+    # Without this, the entire network would be a single linear function
+    output = torch.relu(z)  # max(0, z)
+    
+    return output
 
+# Example: a neuron that detects "high temperature" from features
+# Features: [temperature, humidity, wind_speed]
+x = torch.tensor([35.0, 60.0, 10.0])    # Hot, humid, calm day
+
+# Learned weights (after training):
+# High weight on temperature → temperature matters most
+weights = torch.tensor([0.8, -0.1, 0.2])  
+bias = torch.tensor(-20.0)  # Threshold offset
+
+output = single_neuron(x, weights, bias)
+print(f"Neuron output: {output.item():.4f}")
+# z = 0.8*35 + (-0.1)*60 + 0.2*10 - 20 = 28 + (-6) + 2 - 20 = 4
+# relu(4) = 4.0 (neuron fires)
+```
+
+### 1.2 From One Neuron to a Layer
+
+A **layer** is a group of neurons that all receive the same input. Each neuron learns different features.
+
+```
+Input [x₁, x₂, x₃]
+    │    │    │
+    ├────┼────┤  ← Neuron 1 (w₁, b₁) → o₁
+    ├────┼────┤  ← Neuron 2 (w₂, b₂) → o₂
+    ├────┼────┤  ← Neuron 3 (w₃, b₃) → o₃
+    └────┴────┘  ← Neuron 4 (w₄, b₄) → o₄
+```
+
+Mathematically, a layer computes: **output = activation(X @ W.T + b)**
+- X: input matrix (batch_size × n_inputs)
+- W: weight matrix (n_outputs × n_inputs)
+- b: bias vector (n_outputs,)
+
+```python
+# Manual implementation of a fully connected layer
+def fc_layer(x, weight, bias):
+    """
+    x: input, shape (batch_size, n_inputs)
+    weight: shape (n_outputs, n_inputs)
+    bias: shape (n_outputs,)
+    
+    Returns: shape (batch_size, n_outputs)
+    """
+    # Matrix multiplication applies all neurons at once
+    # Each row of weight corresponds to one neuron's weights
+    z = x @ weight.T + bias   # (batch, n_inputs) @ (n_inputs, n_outputs) → (batch, n_outputs)
+    return torch.relu(z)
+
+# Example: 5 samples, each with 3 features → 4 neurons
+batch_size = 5
+n_inputs = 3
+n_outputs = 4
+
+x = torch.randn(batch_size, n_inputs)
+weight = torch.randn(n_outputs, n_inputs)
+bias = torch.zeros(n_outputs)
+
+output = fc_layer(x, weight, bias)
+print(f"Input shape:  {x.shape}")    # (5, 3)
+print(f"Output shape: {output.shape}")  # (5, 4)
+```
+
+---
+
+## Part 2: nn.Module — PyTorch's Building Block
+
+### 2.1 Why nn.Module Exists
+
+`nn.Module` is the base class for ALL neural network components in PyTorch. It provides:
+- **Automatic parameter tracking** (all `nn.Parameter` objects are registered)
+- **`state_dict()` / `load_state_dict()`** for saving and loading
+- **`.parameters()`** iterator for optimizers
+- **`.train()` / `.eval()` modes** for Dropout, BatchNorm, etc.
+- **Recursive nesting** (modules can contain other modules)
+
+```python
+import torch
+import torch.nn as nn
+
+# Every custom network MUST inherit from nn.Module
+class SingleLayerNet(nn.Module):
+    
+    def __init__(self, n_inputs: int, n_outputs: int):
+        """
+        __init__ defines the STRUCTURE (what layers/params exist)
+        Always call super().__init__() first — this sets up internal bookkeeping
+        """
+        super().__init__()  # NEVER forget this line!
+        
+        # nn.Linear(in_features, out_features) creates a layer:
+        # weight: (out_features, in_features)
+        # bias:   (out_features,)
+        # It automatically registers these as parameters
+        self.linear = nn.Linear(n_inputs, n_outputs)
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(x @ self.weight + self.bias)
+        """
+        forward() defines the COMPUTATION (how data flows through layers)
+        This is called when you do: output = model(x)
+        """
+        return self.linear(x)  # Applies: x @ W.T + b
 
-neuron = SingleNeuron(in_features=4)
-x = torch.randn(8, 4)            # batch of 8 samples
-out = neuron(x)                  # calls neuron.forward(x)
-print(out.shape)                  # (8,) — one output per sample
+# Create the model
+model = SingleLayerNet(n_inputs=10, n_outputs=5)
 
-# Inspect parameters
-for name, param in neuron.named_parameters():
-    print(name, param.shape)
-# weight  torch.Size([4])
-# bias    torch.Size([1])
+# Inspect it
+print(model)
+# SingleLayerNet(
+#   (linear): Linear(in_features=10, out_features=5, bias=True)
+# )
+
+# Count parameters
+total_params = sum(p.numel() for p in model.parameters())
+print(f"Total parameters: {total_params}")  # 10*5 + 5 = 55
+
+# Forward pass
+x = torch.randn(32, 10)  # Batch of 32 samples with 10 features each
+output = model(x)
+print(f"Output shape: {output.shape}")  # (32, 5)
 ```
 
----
-
-## 3.3 Built-In Layers
-
-### Linear (Fully Connected) Layer
-
-```python
-# nn.Linear(in_features, out_features, bias=True)
-# weight: (out, in), bias: (out,)
-# Kaiming-uniform init by default
-
-linear = nn.Linear(128, 64)
-x = torch.randn(32, 128)
-out = linear(x)                  # (32, 64)
-
-print(linear.weight.shape)       # (64, 128)
-print(linear.bias.shape)         # (64,)
-```
-
-### Convolutional Layers
-
-```python
-# 2D Conv (images): (N, C_in, H, W) → (N, C_out, H_out, W_out)
-conv = nn.Conv2d(
-    in_channels=3,
-    out_channels=64,
-    kernel_size=3,
-    stride=1,
-    padding=1,       # 'same' padding to preserve spatial size
-    bias=False,      # often False when followed by BatchNorm
-)
-
-# Output size formula:
-# H_out = (H_in + 2*padding - dilation*(kernel_size-1) - 1) / stride + 1
-
-x = torch.randn(8, 3, 224, 224)
-out = conv(x)                    # (8, 64, 224, 224)
-
-# Depthwise-separable convolution (MobileNet style)
-depthwise   = nn.Conv2d(64, 64, 3, padding=1, groups=64)   # per-channel
-pointwise   = nn.Conv2d(64, 128, 1)                        # 1×1 mixing
-```
-
-### Normalisation Layers
-
-```python
-# Batch Normalisation: normalise over (N, H, W), one stat per channel
-# Best for CNNs with large batch sizes
-bn = nn.BatchNorm2d(num_features=64)
-
-# Layer Normalisation: normalise over the last D dimensions, per sample
-# Best for transformers and RNNs
-ln = nn.LayerNorm(normalized_shape=512)
-
-# Instance Normalisation: normalise per (N, C); style transfer
-inst = nn.InstanceNorm2d(num_features=64)
-
-# Group Normalisation: normalise within groups of channels; small batches
-gn = nn.GroupNorm(num_groups=8, num_channels=64)
-
-# Forward behaviour:
-# BatchNorm uses RUNNING stats during .eval()
-# LayerNorm, InstanceNorm, GroupNorm: no difference between train/eval
-x_img = torch.randn(4, 64, 28, 28)
-print(bn(x_img).shape)       # (4, 64, 28, 28)
-
-x_seq = torch.randn(4, 128, 512)
-print(ln(x_seq).shape)       # (4, 128, 512)
-```
-
-### Dropout & Regularisation
-
-```python
-dropout   = nn.Dropout(p=0.5)    # zero random elements w/ prob p
-dropout2d = nn.Dropout2d(p=0.2)  # zero random CHANNELS (for CNNs)
-
-# IMPORTANT: behaves differently in train vs eval mode
-model.train()   # dropout active
-model.eval()    # dropout disabled (pass-through)
-```
-
-### Pooling
-
-```python
-# Max pooling — takes the max in each window
-max_pool = nn.MaxPool2d(kernel_size=2, stride=2)  # halves H and W
-
-# Average pooling
-avg_pool = nn.AvgPool2d(kernel_size=2, stride=2)
-
-# Adaptive: specify OUTPUT size, not window size
-gap = nn.AdaptiveAvgPool2d(output_size=(1, 1))    # Global Average Pooling
-x = torch.randn(8, 512, 7, 7)
-print(gap(x).shape)           # (8, 512, 1, 1)
-print(gap(x).flatten(1).shape) # (8, 512) — common head pattern
-```
-
-### Embedding Layer
-
-```python
-# Lookup table: integer indices → dense vectors
-# Used for word/token embeddings
-emb = nn.Embedding(num_embeddings=10000, embedding_dim=256)
-
-token_ids = torch.randint(0, 10000, (8, 50))  # (batch, seq_len)
-vectors = emb(token_ids)                       # (8, 50, 256)
-
-# Pretrained initialisation
-emb.weight.data.copy_(pretrained_weights)
-emb.weight.requires_grad = False              # optionally freeze
-```
-
----
-
-## 3.4 Activation Functions
-
-Activations introduce **non-linearity**. Without them, a deep network collapses to a single linear transformation.
-
-```python
-import torch
-import torch.nn.functional as F
-
-x = torch.randn(4, 8)
-
-# ── ReLU: max(0, x) ──────────────────────────────────────────────────────────
-# ∂/∂x = 1 if x > 0, else 0
-# Problem: "dead ReLU" — neurons stuck at 0 if weights too negative
-print(F.relu(x).shape)
-
-# ── Leaky ReLU: max(αx, x) where α is small (e.g. 0.01) ──────────────────────
-print(F.leaky_relu(x, negative_slope=0.01))
-
-# ── GELU: x * Φ(x) where Φ is standard normal CDF ────────────────────────────
-# Smooth approximation used in transformers (BERT, GPT)
-# Mathematically: GELU(x) ≈ 0.5x(1 + tanh(√(2/π)(x + 0.044715x³)))
-print(F.gelu(x))
-
-# ── Sigmoid: 1/(1+e^{-x}), output ∈ (0,1) ────────────────────────────────────
-# ∂/∂x = σ(x)(1-σ(x)), max ≈ 0.25 at x=0 → vanishing gradients in deep nets
-print(torch.sigmoid(x))
-
-# ── Tanh: (e^x - e^{-x})/(e^x + e^{-x}), output ∈ (-1, 1) ──────────────────
-# ∂/∂x = 1 - tanh²(x), max 1 at x=0 → better than sigmoid but still vanishes
-print(torch.tanh(x))
-
-# ── Softmax: exp(xᵢ)/Σ exp(xⱼ), used as output layer for classification ─────
-logits = torch.randn(4, 10)
-probs  = F.softmax(logits, dim=-1)    # (4, 10), sum along dim=-1 equals 1
-log_probs = F.log_softmax(logits, dim=-1)  # numerically stable log
-
-# ── SiLU / Swish: x * sigmoid(x) ─────────────────────────────────────────────
-# Used in EfficientNet, modern CNNs
-print(F.silu(x))
-
-# ── Mish: x * tanh(softplus(x)) ──────────────────────────────────────────────
-print(F.mish(x))
-
-# ── When to use which ─────────────────────────────────────────────────────────
-# Hidden layers: ReLU (default), GELU (transformers), SiLU (CNNs)
-# Output for binary: Sigmoid (or just use BCEWithLogitsLoss)
-# Output for multi-class: Softmax (or just use CrossEntropyLoss)
-# RNNs: Tanh (gates), Sigmoid (forget gate)
-```
-
----
-
-## 3.5 Weight Initialisation
-
-Bad initialisation causes vanishing/exploding gradients from the very first forward pass.
-
-```python
-import torch.nn as nn
-import torch.nn.init as init
-
-def reset_parameters(model: nn.Module):
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            # Xavier/Glorot: designed for sigmoid/tanh
-            # Var(W) = 2 / (fan_in + fan_out)
-            init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                init.zeros_(module.bias)
-
-        elif isinstance(module, nn.Conv2d):
-            # Kaiming/He: designed for ReLU
-            # Var(W) = 2 / fan_in
-            init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-            if module.bias is not None:
-                init.zeros_(module.bias)
-
-        elif isinstance(module, nn.BatchNorm2d):
-            # Standard: weight=1 (scale), bias=0 (shift)
-            init.ones_(module.weight)
-            init.zeros_(module.bias)
-
-        elif isinstance(module, nn.Embedding):
-            # Small normal distribution
-            init.normal_(module.weight, mean=0.0, std=0.02)
-```
-
----
-
-## 3.6 Building Real Architectures
-
-### Multi-Layer Perceptron (MLP)
+### 2.2 Building a Multi-Layer Network (MLP)
 
 ```python
 class MLP(nn.Module):
     """
-    A configurable multi-layer perceptron.
-    Architecture: Linear → [BN → ReLU → Dropout] × (n_layers-1) → Linear
+    Multi-Layer Perceptron with:
+    - Input layer
+    - 2 hidden layers with ReLU activation
+    - Output layer
+    
+    Architecture:
+    Input(784) → Linear(256) → ReLU → Linear(128) → ReLU → Linear(10) → Output
     """
-
-    def __init__(
-        self,
-        in_features: int,
-        hidden_dims: list,           # e.g. [256, 128, 64]
-        out_features: int,
-        dropout: float = 0.0,
-        use_batchnorm: bool = True,
-        activation: str = "relu",
-    ):
+    
+    def __init__(self, n_inputs: int, hidden_sizes: list, n_outputs: int):
         super().__init__()
-        acts = {"relu": nn.ReLU, "gelu": nn.GELU, "silu": nn.SiLU}
-
-        layers = []
-        prev = in_features
-        for hidden in hidden_dims:
-            layers.append(nn.Linear(prev, hidden))
-            if use_batchnorm:
-                layers.append(nn.BatchNorm1d(hidden))
-            layers.append(acts[activation]())
-            if dropout > 0:
-                layers.append(nn.Dropout(p=dropout))
-            prev = hidden
-
-        layers.append(nn.Linear(prev, out_features))
-        self.net = nn.Sequential(*layers)
-
+        
+        # Build layers programmatically
+        self.hidden1 = nn.Linear(n_inputs, hidden_sizes[0])
+        self.hidden2 = nn.Linear(hidden_sizes[0], hidden_sizes[1])
+        self.output = nn.Linear(hidden_sizes[1], n_outputs)
+        
+        # Activation function (shared, stateless — no parameters)
+        self.relu = nn.ReLU()
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        # Layer 1: Linear + ReLU
+        x = self.relu(self.hidden1(x))   # (batch, 784) → (batch, 256)
+        
+        # Layer 2: Linear + ReLU
+        x = self.relu(self.hidden2(x))   # (batch, 256) → (batch, 128)
+        
+        # Output: Linear (no activation — the loss function handles it)
+        x = self.output(x)                # (batch, 128) → (batch, 10)
+        
+        return x
 
+# MNIST-scale model: 28×28 images (784 pixels) → 10 digit classes
+model = MLP(n_inputs=784, hidden_sizes=[256, 128], n_outputs=10)
+print(model)
 
-# Usage
-mlp = MLP(in_features=784, hidden_dims=[512, 256], out_features=10, dropout=0.3)
-x = torch.randn(32, 784)
-print(mlp(x).shape)   # (32, 10)
+# Count parameters per layer
+for name, param in model.named_parameters():
+    print(f"{name}: {param.shape}, {param.numel()} params")
+
+# Test forward pass
+x = torch.randn(64, 784)  # Batch of 64 images
+logits = model(x)
+print(f"Logits shape: {logits.shape}")  # (64, 10)
 ```
 
-### Residual Block (ResNet-style)
+---
+
+## Part 3: Activation Functions — Adding Non-Linearity
+
+### 3.1 Why Activation Functions Are Critical
+
+**Without activation functions**, stacking linear layers is mathematically equivalent to a single linear layer:
+
+```
+Linear₁(Linear₂(x)) = Ax + b  (still linear!)
+```
+
+Activation functions break this linearity, allowing networks to learn **any function** (Universal Approximation Theorem).
+
+```python
+# Demonstrate why non-linearity is essential
+# If we stack two linear layers without activation:
+W1 = torch.randn(4, 3)
+W2 = torch.randn(5, 4)
+# W2 @ (W1 @ x) = (W2 @ W1) @ x  → same as one layer W_combined
+W_combined = W2 @ W1  # shape (5, 3) — equivalent single transformation!
+
+# With activation, this collapsing doesn't happen:
+# relu(W2 @ relu(W1 @ x)) ≠ W_combined @ x
+# The relu makes each layer genuinely useful
+```
+
+### 3.2 The Major Activation Functions
+
+```python
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+x = torch.linspace(-5, 5, 100)  # Input range for visualization
+
+# ── ReLU: Rectified Linear Unit ───────────────────────────────────────────────
+# Formula: max(0, x)
+# Gradient: 1 if x > 0, else 0
+# 
+# PROS: Fast to compute, no vanishing gradient for positive x
+# CONS: "Dead neurons" — if x always < 0, gradient is always 0 (neuron never learns)
+# USE WHEN: Hidden layers of most standard networks (CNNs, MLPs)
+relu = torch.relu(x)
+
+# ── Leaky ReLU: fixes dead neurons ────────────────────────────────────────────
+# Formula: x if x > 0, else 0.01*x
+# Gradient: 1 if x > 0, else 0.01 (never truly zero)
+# USE WHEN: When dead neurons are a problem
+leaky_relu = F.leaky_relu(x, negative_slope=0.01)
+
+# ── ELU: Exponential Linear Unit ─────────────────────────────────────────────
+# Formula: x if x > 0, else α(exp(x) - 1)
+# Gradient: 1 if x > 0, else α*exp(x)
+# PROS: Smooth, centered around zero → faster convergence
+# USE WHEN: Deep networks where batch norm is not used
+elu = F.elu(x, alpha=1.0)
+
+# ── GELU: Gaussian Error Linear Unit ──────────────────────────────────────────
+# Formula: x * Φ(x), where Φ is the cumulative normal distribution
+# ≈ x * sigmoid(1.702 * x) (approximation)
+# PROS: Smooth, probabilistic interpretation, empirically best for transformers
+# USE WHEN: Transformers, BERT, GPT — all modern LLMs use GELU
+gelu = F.gelu(x)
+
+# ── Sigmoid ────────────────────────────────────────────────────────────────────
+# Formula: 1 / (1 + exp(-x))
+# Range: (0, 1) — perfect for binary probability output
+# CONS: Saturates at extremes → vanishing gradients for deep nets
+# USE WHEN: Binary classification output (not hidden layers)
+sigmoid = torch.sigmoid(x)
+
+# ── Tanh: Hyperbolic Tangent ──────────────────────────────────────────────────
+# Formula: (exp(x) - exp(-x)) / (exp(x) + exp(-x))
+# Range: (-1, 1) — zero-centered (better than sigmoid)
+# USE WHEN: RNN hidden states, when zero-centering matters
+tanh = torch.tanh(x)
+
+# ── Softmax: Multi-class probabilities ────────────────────────────────────────
+# Formula: exp(xᵢ) / Σ exp(xⱼ)
+# Output: probability distribution (sums to 1)
+# USE WHEN: Final output for multi-class classification
+# NOTE: In PyTorch, use nn.CrossEntropyLoss which has softmax built in!
+logits = torch.tensor([2.0, 1.0, 0.1])
+probs = F.softmax(logits, dim=0)
+print(f"Softmax output: {probs}")  # [0.659, 0.242, 0.099]  sums to 1
+print(f"Sum: {probs.sum():.4f}")  # 1.0
+```
+
+### 3.3 Choosing the Right Activation
+
+| Location | Recommended | Avoid |
+|----------|-------------|-------|
+| Hidden layers (MLP/CNN) | ReLU, GELU, ELU | Sigmoid, Tanh |
+| Transformer hidden | GELU | Sigmoid, Tanh |
+| RNN hidden states | Tanh, ReLU | Sigmoid |
+| Binary output | Sigmoid | Softmax |
+| Multi-class output | Softmax (via CrossEntropyLoss) | Sigmoid |
+| Regression output | None | Sigmoid, Softmax |
+
+---
+
+## Part 4: Built-in Layers Deep Dive
+
+### 4.1 Linear Layers
+
+```python
+# nn.Linear: applies y = xA^T + b
+# - in_features: number of input features
+# - out_features: number of output neurons
+# - bias: whether to add bias (default True)
+
+layer = nn.Linear(in_features=128, out_features=64, bias=True)
+print(f"Weight shape: {layer.weight.shape}")  # (64, 128)
+print(f"Bias shape:   {layer.bias.shape}")    # (64,)
+
+x = torch.randn(32, 128)  # Batch of 32 samples
+out = layer(x)
+print(f"Output shape: {out.shape}")  # (32, 64)
+```
+
+### 4.2 Batch Normalization — Stabilizing Training
+
+**Batch Normalization** normalizes the inputs of each layer to have zero mean and unit variance. This solves the **internal covariate shift** problem.
+
+**Intuition:** Imagine training with very different input scales at each layer. BatchNorm ensures each layer always sees "nicely scaled" inputs, making training much more stable.
+
+```python
+# Without BatchNorm: activations can become very large or very small
+# over time as weights change, slowing training or causing instability.
+#
+# With BatchNorm: for each mini-batch, normalize to μ=0, σ²=1,
+# then apply learnable scale (γ) and shift (β)
+#
+# Formula: y = γ * (x - μ_batch) / √(σ²_batch + ε) + β
+# During training: uses batch statistics
+# During eval: uses running (exponential moving average) statistics
+
+# 1D BatchNorm (for Linear layers)
+bn1d = nn.BatchNorm1d(num_features=64)
+x = torch.randn(32, 64)  # (batch=32, features=64)
+out = bn1d(x)
+print(f"BatchNorm1d output: {out.shape}")  # (32, 64)
+print(f"Mean before: {x.mean():.4f}, after: {out.mean():.4f}")  # ≈ 0
+print(f"Std before:  {x.std():.4f}, after: {out.std():.4f}")    # ≈ 1
+
+# 2D BatchNorm (for Conv2d layers — most common)
+bn2d = nn.BatchNorm2d(num_features=64)  # 64 channels
+x = torch.randn(32, 64, 28, 28)  # (batch, channels, H, W)
+out = bn2d(x)
+print(f"BatchNorm2d output: {out.shape}")  # (32, 64, 28, 28)
+
+# Important: set train/eval modes correctly!
+bn2d.train()   # Uses batch statistics
+bn2d.eval()    # Uses running statistics (for inference)
+```
+
+### 4.3 Dropout — Regularization through Random Deactivation
+
+**Dropout** randomly sets neurons to zero during training. This prevents **co-adaptation** of neurons — neurons can't rely on specific other neurons, forcing them to learn more robust features.
+
+```python
+# Dropout(p=0.5): zeroes each element with probability p during training
+# During eval mode: passes all elements (no dropout, but scales outputs)
+# The scaling: during training, remaining neurons are divided by (1-p)
+# so expected values are the same at test time (inverted dropout)
+
+dropout = nn.Dropout(p=0.3)  # Drop 30% of neurons
+
+x = torch.ones(5, 10)  # All ones for clarity
+
+dropout.train()  # Training mode
+out_train = dropout(x)
+print(f"Train mode (some zeros): {out_train[0]}")
+
+dropout.eval()   # Eval mode
+out_eval = dropout(x)
+print(f"Eval mode (all pass): {out_eval[0]}")  # All ones
+
+# Common placement: after each hidden layer BEFORE activation, or after activation
+class MLPWithRegularization(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(784, 256),
+            nn.BatchNorm1d(256),  # Normalize
+            nn.ReLU(),            # Activate
+            nn.Dropout(0.3),      # Regularize
+            nn.Linear(256, 10),
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+```
+
+### 4.4 Normalization Variants
+
+```python
+# LayerNorm: normalizes across features (not batch)
+# Used in: Transformers, NLP models
+# Formula: normalize over last `normalized_shape` dimensions
+ln = nn.LayerNorm(normalized_shape=512)
+x = torch.randn(32, 10, 512)  # (batch, seq_len, d_model)
+out = ln(x)
+print(f"LayerNorm output: {out.shape}")  # (32, 10, 512)
+
+# GroupNorm: divides channels into groups, normalizes within each group
+# Used when: batch size is small (e.g., detection, segmentation)
+gn = nn.GroupNorm(num_groups=8, num_channels=64)
+x = torch.randn(4, 64, 56, 56)  # Small batch
+out = gn(x)
+print(f"GroupNorm output: {out.shape}")  # (4, 64, 56, 56)
+
+# When to use which:
+# BatchNorm: large batch classification (CNNs) → best empirical results
+# LayerNorm: transformers, sequences, small/variable batches
+# GroupNorm: detection/segmentation with small batches
+```
+
+---
+
+## Part 5: Weight Initialization
+
+### 5.1 Why Initialization Matters
+
+Poor initialization → vanishing or exploding activations at the start of training → extremely slow convergence or complete failure.
+
+```python
+# The problem: if weights are too large, activations explode
+#              if weights are too small, activations vanish
+
+def demonstrate_initialization_problem():
+    n_layers = 50  # Deep network
+    
+    # Bad initialization: weights drawn from N(0, 1)
+    x = torch.randn(100, 256)
+    for i in range(n_layers):
+        W = torch.randn(256, 256)  # Too large!
+        x = torch.relu(x @ W)
+    print(f"After {n_layers} layers (bad init): mean={x.mean():.4f}, std={x.std():.4f}")
+    # → NaN or inf (exploded)
+    
+    # Good initialization: He/Kaiming (designed for ReLU)
+    # Var(W) = 2/fan_in ensures variance ≈ 1 after ReLU
+    x = torch.randn(100, 256)
+    for i in range(n_layers):
+        W = torch.randn(256, 256) * (2.0 / 256) ** 0.5  # He initialization
+        x = torch.relu(x @ W)
+    print(f"After {n_layers} layers (He init):  mean={x.mean():.4f}, std={x.std():.4f}")
+    # → reasonable values!
+
+demonstrate_initialization_problem()
+```
+
+### 5.2 Initialization Methods in PyTorch
+
+```python
+layer = nn.Linear(256, 128)
+
+# ── Kaiming / He initialization (for ReLU activations) ──────────────────────
+# Var(W) = 2/fan_in — accounts for ReLU zeroing half the activations
+nn.init.kaiming_normal_(layer.weight, mode='fan_in', nonlinearity='relu')
+nn.init.zeros_(layer.bias)  # Bias usually initialized to 0
+
+# ── Xavier / Glorot initialization (for tanh/sigmoid activations) ─────────
+# Var(W) = 2/(fan_in + fan_out) — keeps variance stable for symmetric activations
+nn.init.xavier_normal_(layer.weight)
+
+# ── Orthogonal initialization (for RNNs) ──────────────────────────────────
+# Creates orthogonal matrices → preserves gradient norms
+nn.init.orthogonal_(layer.weight, gain=1.0)
+
+# ── Constant/Zero initialization ─────────────────────────────────────────
+nn.init.zeros_(layer.bias)    # Bias → 0
+nn.init.ones_(layer.weight)   # Weight → 1 (rarely used alone)
+nn.init.constant_(layer.bias, val=0.01)
+
+# Apply proper initialization to a full model:
+def init_weights(module):
+    """Apply to model via model.apply(init_weights)"""
+    if isinstance(module, nn.Linear):
+        nn.init.kaiming_normal_(module.weight, nonlinearity='relu')
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Conv2d):
+        nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+        nn.init.ones_(module.weight)   # Scale γ = 1
+        nn.init.zeros_(module.bias)    # Shift β = 0
+
+model = MLP(784, [256, 128], 10)
+model.apply(init_weights)  # Recursively applies to all submodules
+```
+
+---
+
+## Part 6: Composing Architectures
+
+### 6.1 nn.Sequential — Linear Stacking
+
+```python
+# nn.Sequential: passes output of each module to the next
+# Simple, clean, but limited (no branches, no skips)
+
+model = nn.Sequential(
+    nn.Linear(784, 256),    # Layer 1
+    nn.BatchNorm1d(256),    # Normalize
+    nn.ReLU(),              # Activate
+    nn.Dropout(0.3),        # Regularize
+    nn.Linear(256, 128),    # Layer 2
+    nn.BatchNorm1d(128),
+    nn.ReLU(),
+    nn.Dropout(0.3),
+    nn.Linear(128, 10),     # Output
+)
+
+x = torch.randn(32, 784)
+logits = model(x)
+print(f"Output: {logits.shape}")  # (32, 10)
+```
+
+### 6.2 nn.ModuleList — Dynamic Layer Containers
+
+```python
+# ModuleList: like a Python list, but properly registers modules as children
+# USE WHEN: number of layers varies, or you need to index into layers
+
+class VariableDepthMLP(nn.Module):
+    def __init__(self, layer_sizes: list):
+        super().__init__()
+        # Build layers dynamically
+        self.layers = nn.ModuleList([
+            nn.Linear(layer_sizes[i], layer_sizes[i+1])
+            for i in range(len(layer_sizes) - 1)
+        ])
+        self.activation = nn.ReLU()
+    
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if i < len(self.layers) - 1:  # No activation on last layer
+                x = self.activation(x)
+        return x
+
+# Create networks of different depths
+shallow = VariableDepthMLP([784, 128, 10])
+deep    = VariableDepthMLP([784, 512, 256, 128, 64, 10])
+
+x = torch.randn(32, 784)
+print(f"Shallow output: {shallow(x).shape}")   # (32, 10)
+print(f"Deep output:    {deep(x).shape}")      # (32, 10)
+```
+
+### 6.3 nn.ModuleDict — Named Layer Containers
+
+```python
+class MultiHeadNet(nn.Module):
+    """Network with shared backbone + multiple output heads"""
+    
+    def __init__(self):
+        super().__init__()
+        # Shared feature extractor
+        self.backbone = nn.Sequential(
+            nn.Linear(784, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+        )
+        # Multiple task-specific heads
+        self.heads = nn.ModuleDict({
+            'digit': nn.Linear(128, 10),       # Digit classification
+            'even_odd': nn.Linear(128, 2),     # Even/odd prediction
+            'image_quality': nn.Linear(128, 1) # Quality regression
+        })
+    
+    def forward(self, x, task: str):
+        features = self.backbone(x)
+        return self.heads[task](features)
+
+model = MultiHeadNet()
+x = torch.randn(32, 784)
+print(model(x, 'digit').shape)         # (32, 10)
+print(model(x, 'even_odd').shape)      # (32, 2)
+print(model(x, 'image_quality').shape) # (32, 1)
+```
+
+---
+
+## Part 7: Residual Connections — How Very Deep Networks Train
+
+### 7.1 The Problem: Degradation
+
+Adding more layers to a network should improve it (more capacity). But in practice, very deep networks performed **worse** than shallower ones — not due to overfitting, but due to **optimization difficulty**.
+
+**Key insight:** If a deeper network contains the shallower one as a sub-network (remaining layers = identity), it should perform at least as well. But optimizers struggle to learn identity mappings.
+
+### 7.2 The Solution: Residual Block
 
 ```python
 class ResidualBlock(nn.Module):
     """
-    Pre-activation residual block: BN → ReLU → Conv → BN → ReLU → Conv + skip
+    Instead of learning: output = F(x)
+    Learn:              output = F(x) + x   ← residual connection
+    
+    If the optimal transform is the identity, 
+    the network just needs to learn F(x) = 0 (much easier!)
+    
+    Architecture:
+    x ──────────────────────────────────────────┐
+    │                                            │ (skip connection)
+    └──> Conv → BN → ReLU → Conv → BN ──────(+)──> ReLU ──> output
     """
-
-    def __init__(self, channels: int, stride: int = 1):
+    
+    def __init__(self, channels: int):
         super().__init__()
-
-        self.conv1 = nn.Conv2d(channels, channels, 3, stride=stride, padding=1, bias=False)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn1   = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, 3, stride=1,      padding=1, bias=False)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn2   = nn.BatchNorm2d(channels)
-        self.act   = nn.ReLU(inplace=True)
-
-        # If stride > 1, the skip connection must match spatial size
-        self.skip = nn.Identity() if stride == 1 else nn.Sequential(
-            nn.Conv2d(channels, channels, 1, stride=stride, bias=False),
-            nn.BatchNorm2d(channels),
-        )
-
+        self.relu  = nn.ReLU(inplace=True)
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = self.skip(x)
-        out = self.act(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out = self.act(out + residual)   # ← skip connection
+        identity = x  # Save input for skip connection
+        
+        # Main path: two conv layers
+        out = self.relu(self.bn1(self.conv1(x)))  # Conv1 → BN → ReLU
+        out = self.bn2(self.conv2(out))            # Conv2 → BN (no ReLU yet!)
+        
+        # Skip connection: add identity to output
+        out = out + identity  # The "residual" connection!
+        out = self.relu(out)  # ReLU after addition
+        
         return out
-```
 
-### Using nn.ModuleList and nn.ModuleDict
-
-```python
-class DynamicMLP(nn.Module):
-    """MLP using ModuleList — layers are tracked as parameters."""
-
-    def __init__(self, layer_dims: list):
-        super().__init__()
-        # ModuleList: use when you need to iterate over modules
-        self.layers = nn.ModuleList([
-            nn.Linear(layer_dims[i], layer_dims[i+1])
-            for i in range(len(layer_dims) - 1)
-        ])
-        # WARNING: plain Python lists do NOT register submodules!
-        # self.layers = [nn.Linear(...)]  ← WRONG: params not tracked
-
-    def forward(self, x):
-        for i, layer in enumerate(self.layers):
-            x = layer(x)
-            if i < len(self.layers) - 1:
-                x = F.relu(x)
-        return x
-
-
-class MultiTaskHead(nn.Module):
-    """ModuleDict: when modules are accessed by name."""
-
-    def __init__(self, in_features: int, tasks: dict):
-        super().__init__()
-        # tasks = {"classify": 10, "regress": 1}
-        self.heads = nn.ModuleDict({
-            task: nn.Linear(in_features, n_out)
-            for task, n_out in tasks.items()
-        })
-
-    def forward(self, x, task: str):
-        return self.heads[task](x)
+# Test residual block
+block = ResidualBlock(channels=64)
+x = torch.randn(32, 64, 28, 28)  # (batch, channels, H, W)
+out = block(x)
+print(f"Input shape:  {x.shape}")   # (32, 64, 28, 28)
+print(f"Output shape: {out.shape}") # (32, 64, 28, 28) — same!
 ```
 
 ---
 
-## 3.7 Model Introspection
+## Part 8: Inspecting and Debugging Models
+
+### 8.1 Model Summary and Parameter Counting
 
 ```python
-import torch
-import torch.nn as nn
-from torchinfo import summary
+model = MLP(784, [256, 128], 10)
 
-model = MLP(784, [512, 256], 10, dropout=0.3)
+# Count total parameters
+total = sum(p.numel() for p in model.parameters())
+trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Total params:     {total:,}")
+print(f"Trainable params: {trainable:,}")
 
-# ── torchinfo: detailed summary ───────────────────────────────────────────────
-summary(model, input_size=(32, 784), col_names=["input_size", "output_size", "num_params"])
-
-# ── Manual parameter counting ─────────────────────────────────────────────────
-total_params     = sum(p.numel() for p in model.parameters())
-trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"Total params: {total_params:,}")
-print(f"Trainable:    {trainable_params:,}")
-
-# ── Iterate modules ───────────────────────────────────────────────────────────
-for name, module in model.named_modules():
-    print(f"{name}: {module.__class__.__name__}")
-
-# ── state_dict: model weights for saving/loading ──────────────────────────────
-sd = model.state_dict()          # OrderedDict of {name: tensor}
-print(list(sd.keys()))
-
-# Save and reload
-torch.save(sd, "model_weights.pt")
-model2 = MLP(784, [512, 256], 10)
-model2.load_state_dict(torch.load("model_weights.pt"))
-
-# ── Freezing and unfreezing parameters ───────────────────────────────────────
-for param in model.net[0].parameters():  # freeze first linear layer
-    param.requires_grad = False
-
-# Check which params are trainable
+# Per-layer breakdown
+print("\nLayer-wise parameter count:")
 for name, param in model.named_parameters():
-    if param.requires_grad:
-        print(f"  trainable: {name}")
+    print(f"  {name}: shape={list(param.shape)}, params={param.numel():,}")
 ```
 
----
-
-## 3.8 Train / Eval Mode
+### 8.2 Saving and Loading Models
 
 ```python
-model = MLP(784, [256, 128], 10, dropout=0.5, use_batchnorm=True)
+model = MLP(784, [256, 128], 10)
 
-# ── Training mode: dropout ON, BatchNorm uses batch statistics ───────────────
+# ── Save and load state_dict (RECOMMENDED) ──────────────────────────────────
+# state_dict: OrderedDict mapping parameter names → tensors
+torch.save(model.state_dict(), 'model_weights.pt')
+
+# Load into same architecture
+new_model = MLP(784, [256, 128], 10)
+new_model.load_state_dict(torch.load('model_weights.pt'))
+new_model.eval()  # Always set to eval before inference!
+
+# ── Save entire model (less recommended — fragile across code changes) ────────
+torch.save(model, 'full_model.pt')
+loaded_model = torch.load('full_model.pt')
+```
+
+### 8.3 Train vs Eval Mode
+
+```python
+model = MLPWithRegularization()
+
+# Train mode: Dropout active, BatchNorm uses batch statistics
 model.train()
-out_train = model(torch.randn(32, 784))
+out_train = model(x)
 
-# ── Eval mode: dropout OFF, BatchNorm uses running statistics ────────────────
+# Eval mode: Dropout disabled, BatchNorm uses running statistics
 model.eval()
-with torch.no_grad():           # also disable gradient tracking for speed
-    out_eval = model(torch.randn(32, 784))
+with torch.no_grad():  # Also disable gradient tracking for inference
+    out_eval = model(x)
 
-# The distributions will differ! Always call model.eval() before inference.
-
-# ── Context manager pattern ────────────────────────────────────────────────
-from contextlib import contextmanager
-
-@contextmanager
-def eval_mode(model: nn.Module):
-    was_training = model.training
-    model.eval()
-    try:
-        yield model
-    finally:
-        if was_training:
-            model.train()
-
-with eval_mode(model) as m:
-    pred = m(x)
+# Note: always call model.train() before training loop
+#       always call model.eval() before inference/validation
 ```
 
 ---
 
-## 3.9 Custom Parameterised Module: Scaled Dot-Product Attention (Preview)
+## Key Takeaways
 
-```python
-class ScaledLinear(nn.Module):
-    """
-    A linear layer whose output is divided by sqrt(d_out).
-    Used in attention mechanisms (preview of Module 08).
-    """
-
-    def __init__(self, in_features: int, out_features: int):
-        super().__init__()
-        self.linear = nn.Linear(in_features, out_features, bias=False)
-        self.scale  = out_features ** -0.5   # 1/√d
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x) * self.scale
-```
-
----
-
-## 3.10 Real-World Case Study: MNIST Classifier
-
-```python
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
-
-# ── Model ────────────────────────────────────────────────────────────────────
-class MNISTClassifier(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.flatten = nn.Flatten()
-        self.net = nn.Sequential(
-            nn.Linear(784, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 10),
-        )
-
-    def forward(self, x):
-        return self.net(self.flatten(x))
-
-# ── Data ─────────────────────────────────────────────────────────────────────
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.1307,), (0.3081,)),
-])
-train_ds = datasets.MNIST("./data", train=True,  download=True, transform=transform)
-test_ds  = datasets.MNIST("./data", train=False, download=True, transform=transform)
-train_dl = DataLoader(train_ds, batch_size=128, shuffle=True,  num_workers=2)
-test_dl  = DataLoader(test_ds,  batch_size=256, shuffle=False, num_workers=2)
-
-# ── Training Loop ─────────────────────────────────────────────────────────────
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model  = MNISTClassifier().to(device)
-optim  = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-crit   = nn.CrossEntropyLoss()
-
-for epoch in range(5):
-    model.train()
-    total_loss = correct = total = 0
-    for x, y in train_dl:
-        x, y = x.to(device), y.to(device)
-        optim.zero_grad()
-        logits = model(x)
-        loss   = crit(logits, y)
-        loss.backward()
-        optim.step()
-        total_loss += loss.item() * len(y)
-        correct    += (logits.argmax(1) == y).sum().item()
-        total      += len(y)
-
-    print(f"Epoch {epoch+1}: loss={total_loss/total:.4f}, acc={correct/total:.4f}")
-
-    model.eval()
-    test_correct = test_total = 0
-    with torch.no_grad():
-        for x, y in test_dl:
-            x, y = x.to(device), y.to(device)
-            preds = model(x).argmax(1)
-            test_correct += (preds == y).sum().item()
-            test_total   += len(y)
-    print(f"  Test acc: {test_correct/test_total:.4f}")
-```
+| Concept | Why It Matters |
+|---------|----------------|
+| **nn.Module** | Base class providing parameter tracking, save/load, train/eval modes |
+| **Activation Functions** | Without them, deep = shallow (stacked linear = one linear) |
+| **BatchNorm** | Normalizes layer inputs → faster training, larger learning rates |
+| **Dropout** | Prevents co-adaptation → reduces overfitting |
+| **Weight Init** | Bad init → vanishing/exploding gradients → training failure |
+| **Residual Connections** | Allows training of very deep networks (100+ layers) |
+| **ModuleList/Dict** | Register sub-modules properly so parameters are tracked |
 
 ---
 
 ## Exercises
 
-**Exercise 3.1** Implement a `MultiLayerMLP` from scratch (no `nn.Sequential`), using `nn.ModuleList`. Add `forward_with_intermediates()` that returns the output of each hidden layer.
-
-**Exercise 3.2** Build a `BottleneckBlock` as used in ResNet-50: 1×1 conv (reduce channels) → 3×3 conv → 1×1 conv (restore channels), with a skip projection when needed.
-
-**Exercise 3.3** Implement `ChannelAttention` (Squeeze-and-Excitation block): global average pool → FC → ReLU → FC → Sigmoid → channel-wise scaling. Test on a `(4, 64, 28, 28)` tensor.
-
----
-
-## Module Summary
-
-| Concept | Key Points |
-|---------|-----------|
-| `nn.Module` | Base class for all models; registers params, enables `.to()`, `.state_dict()` |
-| `nn.Parameter` | Tensor that becomes part of `parameters()` |
-| Built-in layers | Linear, Conv2d, BatchNorm, Dropout, Embedding, Pooling |
-| Activations | ReLU (default), GELU (transformers), Sigmoid/Tanh (gates) |
-| Init | Kaiming for ReLU; Xavier for sigmoid/tanh; zeros for biases |
-| `ModuleList/Dict` | Track sub-modules that aren't direct attributes |
-| `train()`/`eval()` | Switch dropout and BatchNorm behaviour |
-| `state_dict` | Model weights as an OrderedDict; save/load |
+1. Build a 4-layer MLP for MNIST (784→512→256→128→10) with BatchNorm and Dropout.
+2. Compare accuracy with/without BatchNorm after 5 epochs of training.
+3. Implement a ResidualBlock and stack 4 of them in a small network.
+4. Write `init_weights` for a network and verify the initial activation statistics are reasonable.
+5. Build a multi-task network with shared backbone and three heads (classification, regression, binary).
 
 ---
 
 ## Quiz
 
-1. What is the difference between `nn.ReLU()` and `F.relu()`?
-2. Why should `bias=False` be used before BatchNorm?
-3. What happens if you store sub-modules in a plain Python `list` instead of `nn.ModuleList`?
-4. What is the dead ReLU problem and how is it mitigated?
-5. Why should you call `model.eval()` before inference?
-6. What does Kaiming initialisation set as the variance of weights, and why?
-7. What is the skip connection's role in a residual block?
+1. **What does `super().__init__()` do in nn.Module?**
+   - Answer: Initializes the parent nn.Module, enabling parameter tracking and other functionality
 
----
+2. **Why is `nn.ModuleList` preferred over a Python list for storing layers?**
+   - Answer: ModuleList registers sub-modules so their parameters appear in `model.parameters()`
 
-*Next: [Module 04 — Training Pipeline Fundamentals](./04_training_pipeline_fundamentals.md)*
+3. **What happens to Dropout in eval mode?**
+   - Answer: It's disabled—all neurons pass through unchanged
+
+4. **What problem does Batch Normalization solve?**
+   - Answer: Internal covariate shift—normalizes inputs so each layer always sees similar distributions
+
+5. **What is the Kaiming initialization formula and for which activation is it designed?**
+   - Answer: Var(W) = 2/fan_in; designed for ReLU (compensates for ReLU zeroing ~half its inputs)
+
+6. **Why do residual connections help very deep networks?**
+   - Answer: They make it easy to learn identity mappings; gradients flow directly through skip connections
+
+7. **What does `model.eval()` change?**
+   - Answer: Disables Dropout; BatchNorm switches from batch to running statistics
+
+8. **What is the Universal Approximation Theorem?**
+   - Answer: A network with one hidden layer of sufficient width and non-linear activations can approximate any continuous function
+
+9. **Why should the output layer rarely have an activation function?**
+   - Answer: Loss functions like CrossEntropyLoss include softmax internally; adding it separately causes double-application
+
+10. **How do you save only model weights (not the entire model)?**
+    - Answer: `torch.save(model.state_dict(), 'weights.pt')`

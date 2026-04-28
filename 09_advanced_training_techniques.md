@@ -1,630 +1,603 @@
-# Module 09: Advanced Training Techniques
+# Module 09: Advanced Training Techniques — Training Bigger, Faster, Better
+
+> **Goal:** Master the techniques that separate hobbyist training from production-grade training — the tricks used to train GPT, BERT, and modern SOTA models.
+
+---
 
 ## Learning Objectives
-By the end of this module you will be able to:
-- Implement gradient accumulation for large effective batch sizes
-- Use mixed precision training (AMP) with `torch.cuda.amp`
-- Apply regularisation: weight decay, dropout variants, stochastic depth
-- Implement learning rate warm-up and cosine annealing with restarts
-- Use exponential moving average (EMA) of model weights
-- Apply gradient checkpointing to train large models with limited memory
-- Debug training instabilities: loss spikes, NaN gradients, oscillation
+
+By the end of this module, you will:
+- **Implement** gradient accumulation to simulate large batches
+- **Use** Automatic Mixed Precision (AMP) for 2-4× speed without accuracy loss
+- **Apply** Exponential Moving Average (EMA) of weights for better generalization
+- **Use** gradient checkpointing to train models larger than GPU memory
+- **Design** learning rate schedules: warmup, cosine annealing, OneCycle
+- **Apply** advanced regularization: DropPath, Mixup, Label Smoothing
 
 ---
 
-## 9.1 Gradient Accumulation
+## Part 1: Gradient Accumulation — Simulating Large Batches
 
-Simulates a larger batch size by accumulating gradients over multiple micro-steps before updating weights. Useful when GPU memory limits batch size.
+### 1.1 Why Large Batches Matter
+
+Large batch training:
+- More stable gradient estimates (less noise)
+- Better utilization of parallel hardware
+- Often leads to better final models
+
+Problem: a batch of 1024 samples might not fit in GPU memory.
+Solution: accumulate gradients over multiple smaller steps before updating.
 
 ```python
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 
-def train_with_accumulation(
+# ── The key insight ────────────────────────────────────────────────────────────
+# Running 4 steps of batch_size=64 with gradient accumulation
+# = mathematically equivalent to 1 step of batch_size=256
+# (assuming you scale the loss correctly)
+
+def train_with_gradient_accumulation(
     model: nn.Module,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
-    device: torch.device,
-    accumulate_steps: int = 4,
-    max_grad_norm: float = 1.0,
-) -> float:
+    train_loader,
+    optimizer,
+    criterion,
+    accumulate_steps: int = 4,  # Effective batch = loader_batch * accumulate_steps
+    device: str = 'cuda'
+):
     """
-    Accumulate over `accumulate_steps` micro-batches before each optimizer.step().
-    Effective batch size = loader.batch_size * accumulate_steps.
+    Gradient accumulation training loop.
+    
+    The trick: divide loss by accumulate_steps BEFORE calling backward().
+    This ensures the accumulated gradient = gradient of the full virtual batch.
+    
+    Without scaling: accumulated grad = 4 * true_grad (too large!)
+    With scaling:    accumulated grad = true_grad (correct!)
     """
     model.train()
-    optimizer.zero_grad()
-    total_loss = 0.0
-    step = 0
-
-    for micro_step, (x, y) in enumerate(loader):
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-
-        # Scale loss so gradients are equivalent to a single large batch
-        loss = criterion(model(x), y) / accumulate_steps
+    optimizer.zero_grad(set_to_none=True)  # Start fresh
+    
+    for step, (x, y) in enumerate(train_loader):
+        x = x.to(device)
+        y = y.to(device)
+        
+        # Forward pass
+        logits = model(x)
+        
+        # Scale loss by number of accumulation steps
+        # This ensures gradient magnitude is consistent regardless of accumulate_steps
+        loss = criterion(logits, y) / accumulate_steps
+        
+        # Backward (accumulate gradients — no optimizer.step() yet!)
         loss.backward()
-        total_loss += loss.item() * accumulate_steps
-
-        is_last_micro = (micro_step + 1) % accumulate_steps == 0
-
-        if is_last_micro or (micro_step + 1) == len(loader):
-            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        
+        # Only update parameters every `accumulate_steps` steps
+        if (step + 1) % accumulate_steps == 0:
+            # Optional: gradient clipping (clip before step!)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
-            optimizer.zero_grad()
-            step += 1
-
-    return total_loss / len(loader)
+            optimizer.zero_grad(set_to_none=True)  # Reset for next accumulation
+        
+        if step % 100 == 0:
+            print(f"Step {step}: loss={loss.item() * accumulate_steps:.4f}")
+            # Multiply by accumulate_steps to see the un-scaled loss
 ```
 
 ---
 
-## 9.2 Automatic Mixed Precision (AMP)
+## Part 2: Automatic Mixed Precision (AMP)
 
-FP16 computation is 2–8× faster on modern GPUs and halves memory usage. The `GradScaler` handles the numerical instability of FP16 gradients.
+### 2.1 What Is Mixed Precision?
+
+Modern GPUs have **Tensor Cores** that perform matrix multiplications in FP16 much faster than FP32:
+- A100: 312 TFLOPS FP16 vs 77 TFLOPS FP32 → **4× faster matmuls!**
+- Memory: FP16 uses 2 bytes vs FP32's 4 bytes → **2× more data in GPU cache**
+
+Problem with pure FP16:
+- Small gradients **underflow** to 0 (FP16 min normal: ~6×10⁻⁵)
+- Model diverges
+
+Solution: **Mixed precision** — compute in FP16, store weights/gradients in FP32.
 
 ```python
-import torch
 from torch.cuda.amp import GradScaler, autocast
 
-def train_amp(
-    model: nn.Module,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
-    device: torch.device,
-    accumulate_steps: int = 1,
-) -> float:
+def train_with_amp(model, train_loader, optimizer, criterion, device='cuda'):
     """
-    AMP training with gradient accumulation support.
+    AMP training with GradScaler.
+    
+    GradScaler solves the underflow problem:
+    1. Multiply loss by large scale factor (e.g., 2^16)
+    2. Backprop with scaled loss → gradients are also scaled up
+    3. Unscale before optimizer step → gradients return to correct magnitude
+    4. If gradients overflow (NaN/Inf): skip this step, reduce scale
+    5. Periodically increase scale to maximize numerical range
     """
-    scaler = GradScaler()  # scales loss to prevent FP16 underflow
     model.train()
-    optimizer.zero_grad()
-    total_loss = 0.0
-
-    for step, (x, y) in enumerate(loader):
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-
-        # Forward pass in FP16
-        with autocast(device_type="cuda", dtype=torch.float16):
-            logits = model(x)
-            loss   = criterion(logits, y) / accumulate_steps
-
-        # Backward pass with scaled loss (prevents FP16 underflow)
+    
+    # GradScaler manages dynamic loss scaling
+    scaler = GradScaler(
+        init_scale=2**16,      # Initial scale factor (start high)
+        growth_factor=2.0,     # Double scale if no overflow for growth_interval steps
+        backoff_factor=0.5,    # Halve scale if overflow detected
+        growth_interval=2000,  # Steps between scale increases
+    )
+    
+    for x, y in train_loader:
+        x = x.to(device)
+        y = y.to(device)
+        
+        optimizer.zero_grad(set_to_none=True)
+        
+        # ── autocast: automatically chooses FP16 or FP32 per operation ────────
+        # Operations in FP16: matmul, conv2d (fast on Tensor Cores)
+        # Operations in FP32: softmax, loss, batchnorm (numerical precision)
+        with autocast(device_type='cuda', dtype=torch.float16):
+            logits = model(x)      # Computed in FP16
+            loss = criterion(logits, y)  # Computed in FP32
+        
+        # Scale the loss before backward (avoids FP16 underflow)
         scaler.scale(loss).backward()
-
-        if (step + 1) % accumulate_steps == 0:
-            # Unscale gradients before clipping (operates in FP32)
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-            # If gradients are finite: update; else: skip step
-            scaler.step(optimizer)
-
-            # Update scaler (may increase/decrease scale factor)
-            scaler.update()
-            optimizer.zero_grad()
-
-        total_loss += loss.item() * accumulate_steps
-
-    return total_loss / len(loader)
+        
+        # Unscale gradients (restores to true magnitude)
+        scaler.unscale_(optimizer)
+        
+        # Clip gradients AFTER unscaling (otherwise clips wrong magnitude)
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        # Step optimizer (skips if gradients contain NaN/Inf)
+        scaler.step(optimizer)
+        
+        # Update scale for next iteration
+        scaler.update()
+    
+    return scaler.get_scale()  # Useful for monitoring
 
 
-# ── BF16: preferred on Ampere+ GPUs (A100, RTX 3090+) ───────────────────────
-# BF16 has the same range as FP32 (8 exponent bits) but lower precision
-# Safer than FP16 — no loss spikes from overflow
-with autocast(device_type="cuda", dtype=torch.bfloat16):
-    output = model(x)
-
-# No GradScaler needed with BF16!
+# BF16: Better format on Ampere+ GPUs (no scaler needed!)
+# BF16 has same exponent range as FP32 → no overflow/underflow
+# 8 exponent bits (like FP32) but only 7 mantissa bits
+def train_with_bf16(model, train_loader, optimizer, criterion, device='cuda'):
+    """
+    BF16 training — cleaner than FP16 (no scaler needed).
+    Requires: Ampere GPU (A100, A10, RTX 3090+) or newer.
+    """
+    model.train()
+    
+    for x, y in train_loader:
+        x = x.to(device)
+        y = y.to(device)
+        
+        optimizer.zero_grad(set_to_none=True)
+        
+        with autocast(device_type='cuda', dtype=torch.bfloat16):
+            logits = model(x)
+            loss = criterion(logits, y)
+        
+        # No scaler needed for BF16!
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
 ```
 
 ---
 
-## 9.3 Stochastic Depth (DropPath)
+## Part 3: Exponential Moving Average (EMA)
 
-Randomly drops entire residual branches during training. Originally from "Deep Networks with Stochastic Depth" (Huang et al., 2016); now used in DeiT, Swin, ConvNeXt.
+### 3.1 What Is EMA and Why It Helps
+
+EMA maintains a "smoothed" version of model weights:
+```
+ema_weights = decay * ema_weights + (1 - decay) * current_weights
+```
+
+Training with SGD/Adam is **noisy** — weights oscillate around the optimum. The EMA tracks the "average position" over many steps, landing in a flatter, more generalizable part of the loss landscape.
+
+**Empirical result:** EMA weights almost always outperform raw weights by 0.1–1.0% accuracy.
 
 ```python
-import torch
-import torch.nn as nn
+import copy
+from torch import nn
 
-class DropPath(nn.Module):
-    """
-    Drops the entire residual contribution with probability `drop_prob`.
-    Applied per-sample within a batch.
-    Identity during evaluation.
-    """
-
-    def __init__(self, drop_prob: float = 0.0):
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.training or self.drop_prob == 0.0:
-            return x
-        # Bernoulli mask: 1 = keep, 0 = drop (shape: batch, 1, 1, ...)
-        keep_prob = 1 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        mask  = torch.bernoulli(torch.full(shape, keep_prob, device=x.device))
-        return x * mask / keep_prob   # scale up to maintain expected value
-
-
-def build_stochastic_depth_rates(n_layers: int, max_drop_rate: float = 0.1) -> list:
-    """
-    Linearly increase drop rate from 0 to max_drop_rate.
-    Standard practice: first layer is never dropped.
-    """
-    return [max_drop_rate * i / (n_layers - 1) for i in range(n_layers)]
-
-
-# Usage in a block
-class ConvNeXtBlock(nn.Module):
-    def __init__(self, dim: int, drop_path_rate: float = 0.0):
-        super().__init__()
-        self.dw_conv = nn.Conv2d(dim, dim, 7, padding=3, groups=dim)
-        self.norm    = nn.LayerNorm(dim)
-        self.pw1     = nn.Linear(dim, 4 * dim)
-        self.pw2     = nn.Linear(4 * dim, dim)
-        self.act     = nn.GELU()
-        self.drop    = DropPath(drop_path_rate)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.dw_conv(x)
-        x = x.permute(0, 2, 3, 1)    # NCHW → NHWC for LayerNorm
-        x = self.pw2(self.act(self.pw1(self.norm(x))))
-        x = x.permute(0, 3, 1, 2)    # NHWC → NCHW
-        return residual + self.drop(x)
-```
-
----
-
-## 9.4 Exponential Moving Average (EMA)
-
-EMA of model weights often gives better test performance than the last checkpoint:
-
-```
-θ_ema ← α · θ_ema + (1 - α) · θ_model
-```
-
-Used in: DeiT, YOLOv8, Stable Diffusion, Whisper.
-
-```python
-import torch
-import torch.nn as nn
-from copy import deepcopy
-
-class EMA:
+class ExponentialMovingAverage:
     """
     Maintains an exponential moving average of model parameters.
-    Typical decay: 0.9999 for large models, 0.999 for smaller ones.
+    
+    Typical decay values:
+    - 0.999 for long training runs (slow accumulation)
+    - 0.9999 for very long runs (even slower)
+    - 0.99 for short training (faster adaptation)
+    
+    Higher decay = smoother/slower EMA = more conservative updates
     """
-
+    
     def __init__(self, model: nn.Module, decay: float = 0.9999):
-        self.decay    = decay
-        self.model    = deepcopy(model).eval()   # shadow model
-        # Disable gradient on shadow model
-        for p in self.model.parameters():
-            p.requires_grad_(False)
-
+        self.decay = decay
+        
+        # Create a deep copy of the model to store EMA weights
+        # This copy is NOT used for training — only for evaluation
+        self.ema_model = copy.deepcopy(model)
+        self.ema_model.eval()  # Always in eval mode
+        
+        # Disable gradient tracking for EMA model (never trained directly)
+        for param in self.ema_model.parameters():
+            param.requires_grad_(False)
+    
     @torch.no_grad()
     def update(self, model: nn.Module):
-        """Call after every optimizer.step()."""
-        for ema_p, p in zip(self.model.parameters(), model.parameters()):
-            ema_p.data.mul_(self.decay).add_(p.data, alpha=1.0 - self.decay)
-
-    def eval_model(self) -> nn.Module:
-        """Returns the EMA model for evaluation."""
-        return self.model
-
-    def state_dict(self):
-        return {"model": self.model.state_dict(), "decay": self.decay}
-
-    def load_state_dict(self, state: dict):
-        self.model.load_state_dict(state["model"])
-        self.decay = state["decay"]
+        """
+        Update EMA weights after each training step.
+        ema_param = decay * ema_param + (1-decay) * model_param
+        """
+        for ema_param, param in zip(self.ema_model.parameters(), model.parameters()):
+            # in-place update: more memory efficient
+            ema_param.data.mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
+    
+    def get_model(self) -> nn.Module:
+        """Return the EMA model for evaluation/inference"""
+        return self.ema_model
 
 
 # Usage in training loop
-model = resnet50()
-ema   = EMA(model, decay=0.9999)
-optim = torch.optim.AdamW(model.parameters(), lr=1e-3)
+model = nn.Linear(10, 5).cuda()
+ema = ExponentialMovingAverage(model, decay=0.9999)
+optimizer = torch.optim.AdamW(model.parameters())
 
 for epoch in range(100):
-    for x, y in train_dl:
-        optim.zero_grad()
+    model.train()
+    for x, y in train_loader:
+        optimizer.zero_grad()
         loss = criterion(model(x), y)
         loss.backward()
-        optim.step()
-        ema.update(model)   # ← update EMA after each step
-
+        optimizer.step()
+        
+        # Update EMA after EVERY optimizer step
+        ema.update(model)
+    
     # Evaluate using EMA model
-    ema_model = ema.eval_model()
-    val_acc = evaluate(ema_model, val_dl, device)
+    ema_model = ema.get_model()
+    ema_model.eval()
+    with torch.no_grad():
+        val_acc = evaluate(ema_model, val_loader)
+    print(f"Epoch {epoch}: EMA val acc = {val_acc:.4f}")
 ```
 
 ---
 
-## 9.5 Gradient Checkpointing
+## Part 4: Gradient Checkpointing
 
-Trades compute for memory: instead of storing all intermediate activations for backprop, recompute them during the backward pass. Enables training models ~3–4× larger.
+### 4.1 The Memory Problem in Deep Networks
+
+During backpropagation, PyTorch stores **all intermediate activations** from the forward pass. For a 1B parameter model, this can require hundreds of GB of GPU memory.
+
+**Gradient checkpointing** trades compute for memory:
+- Don't store intermediate activations
+- During backward pass, recompute activations on-the-fly
+- Memory: O(√N) instead of O(N)
+- Speed: ~33% slower (one extra forward pass)
 
 ```python
-import torch
-import torch.nn as nn
-from torch.utils.checkpoint import checkpoint, checkpoint_sequential
+import torch.utils.checkpoint as checkpoint
 
-# ── Method 1: checkpoint_sequential for sequential models ─────────────────────
-model = nn.Sequential(*[nn.Linear(512, 512) for _ in range(20)])
-
-def forward_with_checkpointing(model, x):
-    # Splits model into 4 segments; only 1/4 of activations stored at a time
-    return checkpoint_sequential(model, segments=4, input=x)
-
-# ── Method 2: checkpoint individual forward calls ─────────────────────────────
-class CheckpointedResidualBlock(nn.Module):
-    def __init__(self, block: nn.Module, use_checkpoint: bool = True):
+class MemoryEfficientTransformer(nn.Module):
+    """
+    Transformer with gradient checkpointing for large models.
+    """
+    
+    def __init__(self, d_model=768, n_heads=12, n_layers=12):
         super().__init__()
-        self.block = block
-        self.use_checkpoint = use_checkpoint
+        from module_08 import GPTDecoderBlock  # reuse from previous module
+        self.blocks = nn.ModuleList([
+            GPTDecoderBlock(d_model, n_heads, d_model*4)
+            for _ in range(n_layers)
+        ])
+    
+    def forward(self, x):
+        for block in self.blocks:
+            # checkpoint.checkpoint: recomputes activations during backward
+            # instead of storing them → saves ~60-70% activation memory
+            x = checkpoint.checkpoint(
+                block,           # The module to checkpoint
+                x,               # Input argument
+                use_reentrant=False  # New API (more flexible)
+            )
+        return x
 
+# Memory comparison (rough estimate for 12-layer transformer):
+# Without checkpointing: stores activations for ALL 12 layers
+# With checkpointing: stores activations for SQRT(12) ≈ 4 layers
+# Memory savings: ~60-70%
+# Speed cost: ~33% (one extra forward pass for recomputation)
+```
+
+---
+
+## Part 5: Learning Rate Schedules
+
+### 5.1 Warmup + Cosine Annealing
+
+```python
+import math
+
+def get_cosine_with_warmup_schedule(
+    optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_lr_ratio: float = 0.1,
+):
+    """
+    Linear warmup then cosine decay.
+    Used by: BERT, GPT-2, most modern transformers.
+    
+    Phase 1 (warmup): LR linearly increases from 0 → peak
+        Reason: AdamW needs several steps to build reliable gradient statistics.
+        Starting with large LR can push weights to bad regions.
+    
+    Phase 2 (cosine): LR decreases from peak → min following cosine curve
+        Reason: Slow annealing helps find flatter minima that generalize better.
+    
+    Formula:
+    Warmup: lr = peak_lr * step / warmup_steps
+    Cosine: lr = min_lr + 0.5*(peak_lr - min_lr) * (1 + cos(π * progress))
+    """
+    def lr_lambda(step):
+        if step < num_warmup_steps:
+            # Linear warmup
+            return float(step) / float(max(1, num_warmup_steps))
+        
+        # Cosine decay
+        progress = (step - num_warmup_steps) / max(1, num_training_steps - num_warmup_steps)
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        # Scale between min_lr_ratio and 1.0
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+    
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+# Visualize the schedule
+optimizer = torch.optim.AdamW([torch.zeros(1)], lr=1e-3)
+scheduler = get_cosine_with_warmup_schedule(
+    optimizer, num_warmup_steps=500, num_training_steps=10000
+)
+
+lrs = []
+for step in range(10000):
+    scheduler.step()
+    lrs.append(optimizer.param_groups[0]['lr'])
+
+# LR pattern:
+# 0-500 steps:   0 → 1e-3 (warmup)
+# 500-10000:     1e-3 → 1e-4 (cosine decay)
+```
+
+---
+
+## Part 6: Advanced Regularization
+
+### 6.1 Label Smoothing
+
+```python
+# Standard cross-entropy uses hard labels: [0, 0, 1, 0, 0]
+# Model trained to output 100% confidence → overconfident, poor calibration
+#
+# Label smoothing: replace hard label with soft label
+# [0, 0, 1, 0, 0] → [0.025, 0.025, 0.9, 0.025, 0.025]
+# = 0.9 probability on true class, 0.025/4 on others
+#
+# Effect: prevents overconfidence, improves calibration, slight regularization
+
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+# That's it! Built into PyTorch.
+
+# Understanding what it does:
+# Hard CE:   -log(p_true)
+# Smooth CE: -[ε/K * Σlog(p_j)] + [(1-ε) * (-log(p_true))]
+# ε = smoothing parameter (0.1 is standard)
+# K = number of classes
+```
+
+### 6.2 DropPath (Stochastic Depth)
+
+```python
+class DropPath(nn.Module):
+    """
+    Stochastic Depth: randomly drop entire residual blocks during training.
+    
+    For each sample in the batch, with probability `drop_prob`, 
+    skip the entire residual computation (just return the identity x).
+    
+    This is different from Dropout:
+    - Dropout: drop individual neurons
+    - DropPath: drop entire block computations
+    
+    Effect: acts like training an ensemble of shallower networks.
+    Used in: DeiT, Swin Transformer, ConvNeXt.
+    Typical drop_prob: 0.1 to 0.2, linearly increasing from 0 for deeper layers.
+    """
+    
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_checkpoint and self.training:
-            # Recompute block during backward instead of storing activations
-            return checkpoint(self.block, x, use_reentrant=False)
-        return self.block(x)
+        if not self.training or self.drop_prob == 0.0:
+            return x  # No dropping during eval
+        
+        # Random mask per sample in the batch
+        keep_prob = 1.0 - self.drop_prob
+        # Shape: (batch, 1, 1, 1) for 4D tensors — broadcast over spatial dims
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        
+        # Bernoulli mask: 1 with prob keep_prob, 0 with prob drop_prob
+        random_tensor = torch.rand(shape, device=x.device) < keep_prob
+        
+        # Scale retained samples to maintain expected value
+        # E[output] = keep_prob * x/keep_prob + drop_prob * 0 = x
+        return x * random_tensor.float() / keep_prob
 
-# ── Method 3: for transformers ────────────────────────────────────────────────
-class CheckpointedTransformerBlock(nn.Module):
-    def __init__(self, block: nn.Module):
-        super().__init__()
-        self.block = block
-
-    def forward(self, x, mask=None):
-        def create_custom_forward(module):
-            def custom_forward(*inputs):
-                return module(*inputs)
-            return custom_forward
-
-        if self.training:
-            return checkpoint(create_custom_forward(self.block), x, mask, use_reentrant=False)
-        return self.block(x, mask)
+# Apply with linearly increasing drop rate per layer (deeper = more dropout)
+n_layers = 12
+drop_probs = [i * 0.2 / (n_layers - 1) for i in range(n_layers)]
+# Layer 0: 0.0, Layer 6: 0.1, Layer 11: 0.2
 ```
 
----
-
-## 9.6 Learning Rate Warm-Up Strategies
+### 6.3 Complete Advanced Training Loop
 
 ```python
-import torch
-import numpy as np
-
-class WarmupCosineSchedule:
-    """
-    Linear warmup followed by cosine annealing.
-    Used in BERT, GPT, ViT training.
-    """
-
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        warmup_steps: int,
-        total_steps: int,
-        min_lr_ratio: float = 0.1,
-    ):
-        self.optimizer     = optimizer
-        self.warmup_steps  = warmup_steps
-        self.total_steps   = total_steps
-        self.min_lr_ratio  = min_lr_ratio
-        self.base_lrs      = [g["lr"] for g in optimizer.param_groups]
-        self.current_step  = 0
-
-    def step(self):
-        self.current_step += 1
-        lrs = self._get_lrs()
-        for lr, group in zip(lrs, self.optimizer.param_groups):
-            group["lr"] = lr
-
-    def _get_lrs(self) -> list:
-        step = self.current_step
-        if step < self.warmup_steps:
-            scale = step / max(1, self.warmup_steps)
-        else:
-            progress = (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
-            scale    = self.min_lr_ratio + (1 - self.min_lr_ratio) * 0.5 * (1 + np.cos(np.pi * progress))
-        return [base * scale for base in self.base_lrs]
-
-
-class CosineAnnealingWithRestarts:
-    """
-    SGDR: Cosine Annealing with Warm Restarts (Loshchilov & Hutter, 2017).
-    Periodically resets LR to max then re-decays — allows escaping local minima.
-    """
-
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        T_0: int = 100,       # initial cycle length
-        T_mult: int = 2,      # multiply cycle length after each restart
-        eta_min: float = 1e-6,
-    ):
-        self.sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min
-        )
-
-    def step(self, epoch: float):
-        self.sched.step(epoch)
-```
-
----
-
-## 9.7 Label Smoothing & Mixup in Training
-
-```python
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class LabelSmoothingCrossEntropy(nn.Module):
-    """
-    Cross-entropy with label smoothing.
-    Replaces hard targets y ∈ {0,1} with smooth y = (1-ε)·y + ε/K
-    where K is the number of classes and ε is the smoothing factor.
-    Prevents overconfidence and improves calibration.
-    """
-
-    def __init__(self, smoothing: float = 0.1, reduction: str = "mean"):
-        super().__init__()
-        self.smoothing = smoothing
-        self.reduction = reduction
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        n_cls = logits.size(-1)
-        log_probs = F.log_softmax(logits, dim=-1)
-
-        # Hard targets → one-hot
-        with torch.no_grad():
-            smooth_targets = torch.full_like(log_probs, self.smoothing / (n_cls - 1))
-            smooth_targets.scatter_(-1, targets.unsqueeze(-1), 1.0 - self.smoothing)
-
-        loss = -(smooth_targets * log_probs).sum(dim=-1)
-        if self.reduction == "mean":
-            return loss.mean()
-        elif self.reduction == "sum":
-            return loss.sum()
-        return loss
-
-
-class MixupAugmentation:
-    """
-    Mixup (Zhang et al., 2018): interpolate two samples and their labels.
-    Forces the model to behave linearly between training examples.
-    """
-
-    def __init__(self, alpha: float = 0.2):
-        self.alpha = alpha
-        self.dist  = torch.distributions.Beta(alpha, alpha)
-
-    def __call__(self, x: torch.Tensor, y: torch.Tensor) -> tuple:
-        if not self.training:
-            return x, y, y, 1.0
-
-        lam  = self.dist.sample().item()
-        idx  = torch.randperm(x.size(0), device=x.device)
-        x_mix = lam * x + (1 - lam) * x[idx]
-        return x_mix, y, y[idx], lam
-
-    def criterion(self, pred, y_a, y_b, lam, criterion):
-        return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
-```
-
----
-
-## 9.8 Complete Advanced Training Loop
-
-```python
-import torch
-import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
-
-def advanced_train_epoch(
+def advanced_training_loop(
     model: nn.Module,
-    loader: torch.utils.data.DataLoader,
-    optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
-    scaler: GradScaler,
-    scheduler,
-    ema: EMA,
-    device: torch.device,
-    accumulate_steps: int = 1,
-    max_grad_norm: float = 1.0,
-    use_amp: bool = True,
-) -> dict:
-    model.train()
-    optimizer.zero_grad()
-
-    total_loss = 0.0
-    n_correct  = 0
-    n_total    = 0
-    opt_steps  = 0
-
-    for micro_step, (x, y) in enumerate(loader):
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-
-        ctx = autocast(device_type="cuda", dtype=torch.float16) if use_amp else torch.no_grad.__class__()
-
-        with (autocast(device_type="cuda") if use_amp else contextlib.nullcontext()):
-            logits = model(x)
-            loss   = criterion(logits, y) / accumulate_steps
-
-        if use_amp:
+    train_loader,
+    val_loader,
+    n_epochs: int = 100,
+    device: str = 'cuda',
+    base_lr: float = 3e-4,
+    weight_decay: float = 0.05,
+    gradient_accumulate: int = 4,
+    label_smoothing: float = 0.1,
+    ema_decay: float = 0.9999,
+    clip_grad_norm: float = 1.0,
+):
+    model = model.to(device)
+    
+    # Loss with label smoothing
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    
+    # AdamW optimizer (separate weight decay from adaptive learning rate)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=base_lr,
+        weight_decay=weight_decay,
+        betas=(0.9, 0.999)
+    )
+    
+    # Calculate total steps for scheduler
+    steps_per_epoch = len(train_loader) // gradient_accumulate
+    total_steps = n_epochs * steps_per_epoch
+    
+    # Cosine schedule with warmup
+    scheduler = get_cosine_with_warmup_schedule(
+        optimizer,
+        num_warmup_steps=int(0.05 * total_steps),  # 5% warmup
+        num_training_steps=total_steps,
+    )
+    
+    # AMP scaler
+    scaler = GradScaler()
+    
+    # EMA
+    ema = ExponentialMovingAverage(model, decay=ema_decay)
+    
+    best_val_acc = 0.0
+    global_step = 0
+    
+    for epoch in range(n_epochs):
+        model.train()
+        running_loss = 0.0
+        optimizer.zero_grad(set_to_none=True)
+        
+        for step, (x, y) in enumerate(train_loader):
+            x, y = x.to(device), y.to(device)
+            
+            # AMP forward pass
+            with autocast(device_type='cuda', dtype=torch.bfloat16):
+                logits = model(x)
+                loss = criterion(logits, y) / gradient_accumulate
+            
+            # AMP backward
             scaler.scale(loss).backward()
-        else:
-            loss.backward()
-
-        total_loss += loss.item() * accumulate_steps
-        n_correct  += (logits.argmax(-1) == y).sum().item()
-        n_total    += len(y)
-
-        is_update_step = (micro_step + 1) % accumulate_steps == 0 or (micro_step + 1) == len(loader)
-
-        if is_update_step:
-            if use_amp:
+            
+            # Update every gradient_accumulate steps
+            if (step + 1) % gradient_accumulate == 0:
                 scaler.unscale_(optimizer)
-            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-
-            if use_amp:
+                nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
-            else:
-                optimizer.step()
-
-            optimizer.zero_grad()
-            ema.update(model)
-
-            if hasattr(scheduler, "step_batch"):
+                optimizer.zero_grad(set_to_none=True)
+                
+                # Update EMA after each optimizer step
+                ema.update(model)
+                
+                # Step scheduler
                 scheduler.step()
-
-            opt_steps += 1
-
-    return {
-        "loss":     total_loss / len(loader),
-        "acc":      n_correct / n_total,
-        "opt_steps": opt_steps,
-    }
+                global_step += 1
+            
+            running_loss += loss.item() * gradient_accumulate
+        
+        # Validation with EMA model
+        ema_model = ema.get_model()
+        ema_model.eval()
+        correct = total = 0
+        with torch.no_grad():
+            for x, y in val_loader:
+                x, y = x.to(device), y.to(device)
+                preds = ema_model(x).argmax(1)
+                correct += (preds == y).sum().item()
+                total += len(y)
+        
+        val_acc = correct / total
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save({
+                'epoch': epoch,
+                'model': model.state_dict(),
+                'ema': ema.ema_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'val_acc': val_acc,
+            }, 'best_checkpoint.pt')
+        
+        print(f"Epoch {epoch+1:3d} | Loss: {running_loss/len(train_loader):.4f} "
+              f"| Val Acc: {val_acc:.4f} | LR: {current_lr:.2e}")
+    
+    print(f"Best val acc: {best_val_acc:.4f}")
 ```
 
 ---
 
-## 9.9 Diagnosing Training Instabilities
+## Key Takeaways
 
-```python
-import torch
-import torch.nn as nn
-from typing import Dict
-
-class TrainingMonitor:
-    """Attach to a model to track gradient health during training."""
-
-    def __init__(self, model: nn.Module, log_every: int = 100):
-        self.model     = model
-        self.log_every = log_every
-        self.step      = 0
-        self._hooks    = []
-        self._grad_norms: Dict[str, list] = {}
-        self._attach_hooks()
-
-    def _attach_hooks(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                handle = param.register_hook(self._make_hook(name))
-                self._hooks.append(handle)
-
-    def _make_hook(self, name: str):
-        def hook(grad):
-            if grad is None:
-                return
-            norm = grad.norm().item()
-            self._grad_norms.setdefault(name, []).append(norm)
-        return hook
-
-    def log(self) -> dict:
-        self.step += 1
-        if self.step % self.log_every != 0:
-            return {}
-
-        report = {}
-        for name, norms in self._grad_norms.items():
-            if norms:
-                report[name] = {
-                    "mean": sum(norms) / len(norms),
-                    "max":  max(norms),
-                    "min":  min(norms),
-                    "has_nan": any(n != n for n in norms),
-                }
-        self._grad_norms.clear()
-
-        # Check for dead neurons (zero-norm layers)
-        dead = [k for k, v in report.items() if v["max"] < 1e-7]
-        if dead:
-            print(f"  ⚠ Possible dead gradients in: {dead}")
-
-        # Check for exploding gradients
-        exploding = [k for k, v in report.items() if v["max"] > 100]
-        if exploding:
-            print(f"  ⚠ Large gradients in: {exploding}")
-
-        return report
-
-    def remove_hooks(self):
-        for h in self._hooks:
-            h.remove()
-        self._hooks.clear()
-```
-
----
-
-## 9.10 Best Practices Checklist
-
-| Technique | When to Apply | Expected Benefit |
-|-----------|--------------|-----------------|
-| AMP (FP16/BF16) | Always on GPU | 2–3× throughput, 2× memory |
-| Gradient accumulation | When batch size is limited by memory | Stable training at large effective batch |
-| EMA weights | Most tasks | +0.5–1% accuracy on evaluation |
-| Gradient checkpointing | Transformer / very deep models | Train 3–4× larger model same memory |
-| Stochastic depth | Deep CNNs and transformers (>12 layers) | Better regularisation, faster training |
-| Label smoothing | All classification tasks | Better calibration, prevents overconfidence |
-| Mixup/CutMix | Image classification | +1–2% on ImageNet-scale tasks |
-| Warmup LR | Transformers especially | Prevents early divergence |
-| Cosine with restarts (SGDR) | Long training runs | Can find better minima |
-| `torch.compile` | PyTorch 2.0+, all models | 20–50% speedup with one line of code |
-
-```python
-# One-line speedup: torch.compile (PyTorch 2.0+)
-import torch
-model = MyModel()
-model = torch.compile(model)   # traces and compiles the computation graph
-# Works with autograd, AMP, DDP; best on A100/H100
-```
-
----
-
-## Exercises
-
-**Exercise 9.1** Benchmark AMP vs full FP32 training on ResNet-50 + CIFAR-10. Report: throughput (samples/s), peak GPU memory, and final validation accuracy.
-
-**Exercise 9.2** Implement `CutMix` from scratch. Verify that the expected mixing ratio matches the actual pixel-level mixing ratio. Combine with `MixUp` in a 50/50 split strategy as used in DeiT.
-
-**Exercise 9.3** Add gradient checkpointing to `MiniGPT` from Module 08. Measure the maximum sequence length you can train with 8GB GPU memory with and without checkpointing.
-
----
-
-## Module Summary
-
-| Technique | Core Idea |
-|-----------|----------|
-| Gradient accumulation | Divide loss by N, accumulate N times, then step |
-| AMP | Forward in FP16, loss scale + backward in FP32 |
-| GradScaler | Multiply loss so FP16 grads don't underflow |
-| EMA | Shadow model = α·shadow + (1-α)·model after each step |
-| Gradient checkpointing | Recompute activations in backward instead of storing |
-| DropPath | Drop whole residual branches randomly per sample |
-| Label smoothing | Replace hard 0/1 targets with soft (1-ε)/ε/K targets |
+| Technique | Benefit | Cost |
+|-----------|---------|------|
+| **Gradient Accumulation** | Simulate large batches | Slower training |
+| **AMP (FP16/BF16)** | 2-4× speed, 2× memory | Slight complexity |
+| **EMA weights** | +0.1–1.0% accuracy | Extra memory (2× model) |
+| **Gradient Checkpointing** | 60% memory reduction | 33% slower |
+| **Warmup + Cosine** | Better convergence | Need to tune warmup steps |
+| **Label Smoothing** | Better calibration | Marginal compute |
+| **DropPath** | Regularization | Slower convergence |
 
 ---
 
 ## Quiz
 
-1. Why must you divide the loss by `accumulate_steps` when doing gradient accumulation?
-2. What does `GradScaler` do and why is it needed for FP16 but not BF16?
-3. When would you use gradient checkpointing and what is the memory-compute tradeoff?
-4. Why does EMA give better test accuracy than using the raw model weights?
-5. What is the difference between DropPath and Dropout?
-6. Why use warmup before cosine annealing in transformer training?
+1. **Why must you divide the loss by `accumulate_steps` in gradient accumulation?**
+   - Answer: Ensures accumulated gradients equal the gradient of the full virtual batch
 
----
+2. **What does GradScaler do?**
+   - Answer: Scales loss up before backward to prevent FP16 gradient underflow, then unscales before optimizer step
 
-*Next: [Module 10 — GPU Performance & Mixed Precision](./10_gpu_performance_and_mixed_precision.md)*
+3. **Why is BF16 simpler than FP16 for training?**
+   - Answer: BF16 has same exponent range as FP32 → no underflow, no GradScaler needed
+
+4. **What is the EMA update rule?**
+   - Answer: ema = decay * ema + (1-decay) * current_weights
+
+5. **What is the memory-compute tradeoff in gradient checkpointing?**
+   - Answer: Saves ~60% activation memory at the cost of ~33% extra compute (recomputes during backward)
+
+6. **Why use warmup at the start of training?**
+   - Answer: Lets Adam accumulate reliable gradient statistics before taking large steps; large early LR can push to bad regions
+
+7. **What does label smoothing do to the target distribution?**
+   - Answer: Distributes a small probability mass (ε) uniformly across all classes, reducing overconfidence
+
+8. **What is DropPath and how does it differ from Dropout?**
+   - Answer: DropPath randomly drops entire residual blocks; Dropout randomly zeros individual neurons
+
+9. **What is the `unscale_` step in AMP training for?**
+   - Answer: Restores gradients to correct magnitude before gradient clipping and optimizer step
+
+10. **How do you implement gradient accumulation with DDP (multi-GPU)?**
+    - Answer: Use `model.no_sync()` context manager during accumulation micro-steps to avoid all-reduce on every backward

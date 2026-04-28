@@ -1,503 +1,536 @@
-# Module 13: Deployment — TorchScript & ONNX
+# Module 13: Deployment — TorchScript, ONNX & TensorRT
+
+> **Goal:** Take a trained PyTorch model and make it production-ready — optimized, portable, and fast across different runtimes and hardware.
+
+---
 
 ## Learning Objectives
-By the end of this module you will be able to:
-- Convert PyTorch models to TorchScript via tracing and scripting
-- Export models to ONNX and run inference with ONNX Runtime
-- Apply TensorRT optimisation for maximum GPU inference performance
-- Validate numerical equivalence between export formats and the original model
-- Handle dynamic shapes, custom ops, and common export pitfalls
-- Package and version production model artifacts
-- Choose the right export format for your deployment target
+
+By the end of this module, you will:
+- **Understand** the deployment pipeline from research to production
+- **Export** models with TorchScript (tracing vs scripting) and know which to use
+- **Export** to ONNX and run with ONNX Runtime for cross-platform deployment
+- **Optimize** with TensorRT for maximum GPU inference speed
+- **Benchmark** inference latency, throughput, and memory correctly
+- **Version** and manage model artifacts in production
 
 ---
 
-## 13.1 Deployment Format Decision Tree
+## Part 1: The Deployment Pipeline
+
+### 1.1 Why Not Just Use Raw PyTorch in Production?
+
+Raw PyTorch models require:
+- The Python interpreter (slow startup, GIL, not embedded-friendly)
+- PyTorch installed as a dependency (large, version-sensitive)
+- Gradient tracking overhead (unnecessary for inference)
+
+Production deployments need:
+- **Low latency** (< 10ms for real-time applications)
+- **High throughput** (thousands of requests/second)
+- **Cross-platform** (C++, Java, mobile, embedded systems)
+- **No Python dependency** (for C++ serving, edge deployment)
 
 ```
-Your model → where does it run?
-│
-├─ Python server (same process)
-│   └─ Raw PyTorch + torch.inference_mode()  [simplest]
-│
-├─ C++ application / embedded
-│   └─ TorchScript (.pt)  [best PyTorch → C++ path]
-│
-├─ Cross-framework (TF, TFLite, etc.) / ONNX Runtime
-│   └─ ONNX (.onnx)  [most portable]
-│
-├─ NVIDIA GPU (maximum throughput)
-│   └─ TensorRT (.engine)  [fastest GPU]
-│
-├─ Mobile / browser
-│   ├─ TorchScript + PyTorch Mobile  [iOS/Android]
-│   └─ ONNX → ONNX Runtime Mobile
-│
-└─ CPU-only, maximum compatibility
-    └─ ONNX → ONNX Runtime CPU  [good cross-platform]
+Training Pipeline:
+  Data → Model (PyTorch, Python) → Checkpoint (.pt file)
+
+Deployment Pipeline:
+  Checkpoint → Export → Optimize → Serve
+               ↓
+  ┌────────────────────────────────────────────────────────┐
+  │  TorchScript  → C++ LibTorch, TorchServe              │
+  │  ONNX         → ONNX Runtime (CPU/GPU/Edge)            │
+  │  TensorRT     → NVIDIA GPU, maximum speed              │
+  │  ExecuTorch   → Mobile (iOS, Android), Edge            │
+  └────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 13.2 TorchScript
+## Part 2: TorchScript
 
-TorchScript compiles your model into a statically typed, portable intermediate representation that can run without Python.
+### 2.1 TorchScript Tracing
 
-**Two methods:**
-1. **Tracing** — run the model once; record the operations; best for models without data-dependent control flow
-2. **Scripting** — parse the Python source code with a restricted subset of Python; handles if/loops
-
-### Tracing
+Tracing **records** the operations executed during a single forward pass with a dummy input.
 
 ```python
 import torch
 import torch.nn as nn
 
-model = resnet50(weights="DEFAULT").eval()
-
-# Trace with a representative example input
-example_input = torch.randn(1, 3, 224, 224)
-
-with torch.no_grad():
-    traced = torch.jit.trace(model, example_input)
-
-# Save
-traced.save("resnet50_traced.pt")
-
-# Load (no Python class needed)
-loaded = torch.jit.load("resnet50_traced.pt")
-out = loaded(torch.randn(1, 3, 224, 224))
-
-# Verify equivalence
-torch.testing.assert_close(
-    model(example_input),
-    traced(example_input),
-    rtol=1e-4,
-    atol=1e-4,
-)
-print("Traced model output matches original!")
-
-# Inspect the generated IR
-print(traced.graph)
-print(traced.code)   # Python-like representation of the traced graph
-```
-
-### Scripting
-
-```python
-# Scripting handles dynamic control flow
-
-class DynamicModel(nn.Module):
-    def __init__(self, threshold: float = 0.5):
-        super().__init__()
-        self.threshold = threshold
-        self.fc = nn.Linear(10, 2)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Data-dependent branch: tracing would miss one path!
-        if x.mean() > self.threshold:
-            return self.fc(x)
-        else:
-            return self.fc(-x)
-
-model = DynamicModel().eval()
-
-# Script compiles both branches
-scripted = torch.jit.script(model)
-scripted.save("dynamic_model_scripted.pt")
-
-# Scripted models can be optimised
-torch.jit.optimize_for_inference(scripted)  # fuses ops, removes dead code
-
-# ── Scripting individual functions ────────────────────────────────────────────
-@torch.jit.script
-def top_k_softmax(x: torch.Tensor, k: int) -> torch.Tensor:
-    probs = torch.softmax(x, dim=-1)
-    top_k_vals, top_k_idx = probs.topk(k, dim=-1)
-    return top_k_idx
-
-# ── Hybrid: script a module that uses traced sub-modules ─────────────────────
-class HybridModel(nn.Module):
+class SimpleModel(nn.Module):
     def __init__(self):
         super().__init__()
-        # Trace the backbone (no control flow)
-        backbone = resnet50().eval()
-        self.backbone = torch.jit.trace(backbone, torch.randn(1, 3, 224, 224))
+        self.fc1 = nn.Linear(784, 256)
+        self.fc2 = nn.Linear(256, 10)
+        self.relu = nn.ReLU()
+    
+    def forward(self, x):
+        return self.fc2(self.relu(self.fc1(x)))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = self.backbone(x)
-        # Script handles the conditional
-        if features.max() > 1.0:
-            return features.clamp(max=1.0)
-        return features
+model = SimpleModel().eval()
 
-scripted_hybrid = torch.jit.script(HybridModel())
+# ── Tracing ────────────────────────────────────────────────────────────────────
+# Pro:  Simple, works with most models
+# Con:  Only records ONE execution path — misses conditional branches!
+# Use when: model has no data-dependent control flow
+
+dummy_input = torch.randn(1, 784)  # Must match your actual input shape
+
+with torch.no_grad():
+    traced_model = torch.jit.trace(model, dummy_input)
+
+# Verify outputs match
+with torch.no_grad():
+    x = torch.randn(1, 784)
+    original_out = model(x)
+    traced_out = traced_model(x)
+    max_diff = (original_out - traced_out).abs().max()
+    print(f"Max output difference: {max_diff:.8f}")  # Should be ~0
+
+# Save the traced model
+traced_model.save("model_traced.pt")
+
+# Load and run (no Python/PyTorch model definition needed!)
+loaded = torch.jit.load("model_traced.pt")
+loaded.eval()
+with torch.no_grad():
+    out = loaded(x)
+print(f"Loaded model output: {out.shape}")
 ```
 
-### Common TorchScript Pitfalls
+### 2.2 TorchScript Scripting
+
+Scripting **compiles** the Python source code directly — handles all control flow correctly.
 
 ```python
-# ── Type annotations are mandatory ────────────────────────────────────────────
-class GoodModule(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # ← required
-        return x * 2
-
-# ── Dictionary and list types must be declared ────────────────────────────────
-from typing import Dict, List
-
-@torch.jit.script
-def process_multi_output(x: torch.Tensor) -> Dict[str, torch.Tensor]:
-    return {"logits": x, "probs": x.softmax(-1)}
-
-# ── No *args/**kwargs in scripted modules ─────────────────────────────────────
-# ── No non-primitive Python objects (e.g. dataclasses) ───────────────────────
-# ── Use torch.jit.is_scripting() to branch ────────────────────────────────────
-class BranchableModule(nn.Module):
+class ModelWithBranching(nn.Module):
+    """
+    This model has data-dependent control flow:
+    the path through the network depends on the INPUT value.
+    
+    Tracing would only capture one branch — WRONG!
+    Scripting reads the source code — captures ALL branches — CORRECT!
+    """
+    
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(10, 5)
+        self.fc_large = nn.Linear(10, 5)
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if torch.jit.is_scripting():
-            return x  # simplified path for TorchScript
+        # Data-dependent branch: tracing bakes in ONE path!
+        if x.mean() > 0:
+            return torch.relu(self.fc(x))
         else:
-            return self._full_forward(x)
+            return torch.sigmoid(self.fc_large(x))
+
+model = ModelWithBranching().eval()
+
+# ── Scripting ──────────────────────────────────────────────────────────────────
+# Pro: Handles all control flow correctly (if/for/while)
+# Con: Python code must be TorchScript-compatible (subset of Python)
+#      Cannot use arbitrary Python objects, only TorchScript types
+# Use when: model has conditional logic, loops, or recursive calls
+
+try:
+    scripted_model = torch.jit.script(model)
+    print("Scripting succeeded!")
+    scripted_model.save("model_scripted.pt")
+except Exception as e:
+    print(f"Scripting failed: {e}")
+
+# ── When does scripting fail? ─────────────────────────────────────────────────
+# 1. Using non-TorchScript types (e.g., pandas DataFrames, PIL Images)
+# 2. Using Python builtins not supported in TorchScript
+# 3. Dynamic dispatch on Python objects
+# Solution: refactor the offending code or use @torch.jit.script on specific functions
+```
+
+### 2.3 Optimizing TorchScript for Inference
+
+```python
+# Additional optimizations after scripting/tracing:
+model_scripted = torch.jit.script(SimpleModel().eval())
+
+# 1. Freeze: inline constants and remove Python dispatch overhead
+model_frozen = torch.jit.freeze(model_scripted)
+
+# 2. Optimize for inference: fuse BatchNorm into Conv, constant folding
+model_opt = torch.jit.optimize_for_inference(model_frozen)
+
+# 3. Run with torch.no_grad() for speed (no gradient tracking)
+x = torch.randn(1, 784)
+with torch.no_grad():
+    out = model_opt(x)
+
+# Benchmark the speedup
+import time
+n_reps = 1000
+
+with torch.no_grad():
+    t0 = time.time()
+    for _ in range(n_reps):
+        _ = model(x)
+    eager_ms = (time.time() - t0) * 1000 / n_reps
+    
+    t0 = time.time()
+    for _ in range(n_reps):
+        _ = model_opt(x)
+    opt_ms = (time.time() - t0) * 1000 / n_reps
+
+print(f"Eager:    {eager_ms:.3f} ms")
+print(f"Optimized:{opt_ms:.3f} ms")
+print(f"Speedup:  {eager_ms/opt_ms:.2f}×")
 ```
 
 ---
 
-## 13.3 ONNX Export
+## Part 3: ONNX Export
 
-ONNX (Open Neural Network Exchange) is a cross-framework model format supported by TensorFlow, TFLite, CoreML, ONNX Runtime, TensorRT, and more.
+### 3.1 What Is ONNX?
+
+**Open Neural Network Exchange (ONNX)** is an open format for ML models:
+- Supported by: PyTorch, TensorFlow, scikit-learn, and 30+ frameworks
+- Runs on: ONNX Runtime (CPU, GPU, mobile), TensorRT, OpenVINO, CoreML
+- The universal "lingua franca" of model deployment
 
 ```python
 import torch
+import torch.onnx
+
+model = SimpleModel().eval()
+dummy_input = torch.randn(1, 784)
+
+# ── Export to ONNX ─────────────────────────────────────────────────────────────
+torch.onnx.export(
+    model,                         # Model to export
+    dummy_input,                   # Example input (defines shapes)
+    "model.onnx",                  # Output file path
+    
+    input_names=["input"],         # Names for ONNX graph inputs
+    output_names=["logits"],       # Names for ONNX graph outputs
+    
+    # Dynamic axes: specify which dimensions can vary
+    # Without this, model is fixed to the dummy_input shapes
+    dynamic_axes={
+        "input":  {0: "batch_size"},   # Batch dimension can vary
+        "logits": {0: "batch_size"},
+    },
+    
+    opset_version=17,              # ONNX opset version
+                                    # Higher = more ops supported
+                                    # Must be supported by your runtime
+    
+    do_constant_folding=True,      # Pre-compute constants → faster inference
+    
+    export_params=True,            # Include trained weights in the file
+    verbose=False,                  # Print computation graph (debug mode)
+)
+
+print("ONNX export successful!")
+
+# ── Verify the ONNX model ─────────────────────────────────────────────────────
 import onnx
+
+onnx_model = onnx.load("model.onnx")
+onnx.checker.check_model(onnx_model)  # Validates graph structure
+print(f"ONNX model valid!")
+print(f"Opset: {onnx_model.opset_import[0].version}")
+
+# Inspect the model
+for node in onnx_model.graph.node[:3]:
+    print(f"Op: {node.op_type}, Inputs: {list(node.input)}")
+```
+
+### 3.2 ONNX Runtime Inference
+
+```python
 import onnxruntime as ort
 import numpy as np
 
-model = resnet50(weights="DEFAULT").eval()
-x     = torch.randn(1, 3, 224, 224)
-
-# ── Export to ONNX ────────────────────────────────────────────────────────────
-with torch.no_grad():
-    torch.onnx.export(
-        model,
-        x,
-        "resnet50.onnx",
-        opset_version=17,              # use latest stable opset
-        input_names=["image"],
-        output_names=["logits"],
-        dynamic_axes={                 # enable batch-size flexibility
-            "image":  {0: "batch_size"},
-            "logits": {0: "batch_size"},
-        },
-        export_params=True,
-        do_constant_folding=True,      # fold constant expressions
-        verbose=False,
-    )
-
-# ── Validate ONNX graph ───────────────────────────────────────────────────────
-onnx_model = onnx.load("resnet50.onnx")
-onnx.checker.check_model(onnx_model)
-print("ONNX model is valid!")
-
-# Optional: pretty-print the graph
-print(onnx.helper.printable_graph(onnx_model.graph))
-
-# ── Run with ONNX Runtime ─────────────────────────────────────────────────────
-# Providers: CUDAExecutionProvider, TensorrtExecutionProvider, CPUExecutionProvider
-sess_options = ort.SessionOptions()
-sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-sess_options.intra_op_num_threads = 4
-
-ort_session = ort.InferenceSession(
-    "resnet50.onnx",
-    sess_options,
-    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+# ── Create ONNX Runtime session ────────────────────────────────────────────────
+# ORT automatically selects the best execution provider
+session = ort.InferenceSession(
+    "model.onnx",
+    providers=[
+        'CUDAExecutionProvider',    # GPU (preferred if available)
+        'CPUExecutionProvider',     # CPU fallback
+    ]
 )
 
-# Run inference
-np_input = x.numpy()
-ort_out   = ort_session.run(["logits"], {"image": np_input})[0]  # numpy array
+# Inspect input/output info
+for inp in session.get_inputs():
+    print(f"Input: {inp.name}, shape={inp.shape}, dtype={inp.type}")
+for out in session.get_outputs():
+    print(f"Output: {out.name}, shape={out.shape}, dtype={out.type}")
 
-# ── Numerical validation ──────────────────────────────────────────────────────
+# ── Run inference ─────────────────────────────────────────────────────────────
+# ONNX Runtime uses NumPy arrays, not PyTorch tensors!
+x_np = np.random.randn(32, 784).astype(np.float32)
+
+ort_outputs = session.run(
+    output_names=["logits"],      # Which outputs to compute
+    input_feed={"input": x_np},  # Dictionary: name → numpy array
+)
+
+output = ort_outputs[0]  # (32, 10) numpy array
+print(f"ORT output shape: {output.shape}")
+print(f"ORT output dtype: {output.dtype}")
+
+# ── Verify ORT matches PyTorch ────────────────────────────────────────────────
+x_torch = torch.from_numpy(x_np)
 with torch.no_grad():
-    pt_out = model(x).numpy()
+    pytorch_output = model(x_torch).numpy()
 
-np.testing.assert_allclose(pt_out, ort_out, rtol=1e-3, atol=1e-5)
-print(f"Max absolute difference: {np.abs(pt_out - ort_out).max():.6f}")
-print("ONNX Runtime output matches PyTorch!")
+max_diff = np.abs(pytorch_output - output).max()
+print(f"Max difference PyTorch vs ORT: {max_diff:.8f}")
+# Should be < 1e-5 for well-behaved models
 ```
 
 ---
 
-## 13.4 Dynamic Shapes and Complex Exports
+## Part 4: TensorRT — Maximum GPU Inference Speed
+
+### 4.1 What TensorRT Does
+
+TensorRT is NVIDIA's inference optimization engine:
+1. **Analyzes** the network graph
+2. **Fuses** operators (Conv+BN+ReLU → single kernel)
+3. **Selects** optimal CUDA kernel for each operation on your specific GPU
+4. **Quantizes** to INT8 or FP16 automatically
+5. **Generates** a highly optimized execution plan
+
+**Typical speedups:** 2–8× over raw ONNX Runtime on NVIDIA GPUs.
 
 ```python
-import torch
-import torch.nn as nn
-
-# ── Transformer with dynamic sequence length ──────────────────────────────────
-class TextClassifier(nn.Module):
-    def __init__(self, vocab_size=30522, d_model=256, n_classes=2):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, d_model)
-        self.enc   = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model, nhead=8, batch_first=True),
-            num_layers=4,
-        )
-        self.head  = nn.Linear(d_model, n_classes)
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.embed(input_ids)
-        x = self.enc(x)
-        return self.head(x[:, 0])   # [CLS] token
-
-model = TextClassifier().eval()
-dummy_input = torch.randint(0, 30522, (1, 64))
-
-torch.onnx.export(
-    model,
-    dummy_input,
-    "text_classifier.onnx",
-    opset_version=17,
-    input_names=["input_ids"],
-    output_names=["logits"],
-    dynamic_axes={
-        "input_ids": {0: "batch", 1: "seq_len"},
-        "logits":    {0: "batch"},
-    },
-)
-
-# Verify dynamic shapes work
-sess = ort.InferenceSession("text_classifier.onnx")
-for seq_len in [32, 64, 128, 256]:
-    inp = np.random.randint(0, 30522, (2, seq_len)).astype(np.int64)
-    out = sess.run(None, {"input_ids": inp})
-    print(f"seq_len={seq_len}: output shape={out[0].shape}")
-
-# ── Custom op: register for ONNX export ──────────────────────────────────────
-class CustomNorm(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        return x / x.norm(dim=-1, keepdim=True)
-
-    @staticmethod
-    def symbolic(g, x):
-        # Map to a standard ONNX op
-        norm = g.op("ReduceL2", x, axes_i=[-1], keepdims_i=1)
-        return g.op("Div", x, norm)
-```
-
----
-
-## 13.5 TensorRT Optimisation
-
-TensorRT is NVIDIA's inference optimisation library — it fuses ops, uses INT8/FP16, selects the best kernel for each layer, and is typically 3–10× faster than ONNX Runtime on GPU.
-
-```python
-# Option 1: via torch_tensorrt (PyTorch-native)
+# Method 1: torch_tensorrt (simplest)
 # pip install torch-tensorrt
-import torch_tensorrt
-
-model = resnet50(weights="DEFAULT").eval().cuda()
-x     = torch.randn(32, 3, 224, 224, device="cuda")
-
-trt_model = torch_tensorrt.compile(
-    model,
-    inputs=[
-        torch_tensorrt.Input(
-            min_shape=[1, 3, 224, 224],
-            opt_shape=[32, 3, 224, 224],
-            max_shape=[64, 3, 224, 224],
-            dtype=torch.half,
-        )
-    ],
-    enabled_precisions={torch.half},   # use FP16
-    workspace_size=1 << 30,            # 1 GB workspace for optimization
-)
-
-# Save TensorRT-compiled model
-torch.jit.save(trt_model, "resnet50_trt.ts")
-
-# ── Benchmark comparison ──────────────────────────────────────────────────────
-def benchmark(fn, n_warmup=20, n_runs=100):
-    for _ in range(n_warmup): fn()
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(n_runs): fn()
-    torch.cuda.synchronize()
-    return 1000 * (time.perf_counter() - t0) / n_runs  # ms
-
-x_fp16 = x.half()
-print(f"PyTorch FP32: {benchmark(lambda: model(x)):.2f} ms")
-print(f"PyTorch FP16: {benchmark(lambda: model(x_fp16)):.2f} ms")
-print(f"TensorRT FP16: {benchmark(lambda: trt_model(x_fp16)):.2f} ms")
-# Typical: TRT is 2–5× faster than PT FP16
-
-# Option 2: via polygraphy / trtexec CLI
-# trtexec --onnx=resnet50.onnx --fp16 --saveEngine=resnet50_trt.engine \
-#         --minShapes=image:1x3x224x224 --optShapes=image:32x3x224x224 --maxShapes=image:64x3x224x224
-```
-
----
-
-## 13.6 Model Artifact Versioning
-
-```python
-import torch
-import json
-from dataclasses import dataclass, asdict
-from datetime import datetime
-from pathlib import Path
-
-@dataclass
-class ModelMetadata:
-    model_name: str
-    version: str
-    architecture: str
-    training_data: str
-    input_shape: list
-    output_shape: list
-    accuracy: float
-    latency_ms: float
-    created_at: str
-    torch_version: str
-    export_format: str
-    notes: str = ""
-
-def package_model(
-    model: torch.nn.Module,
-    metadata: ModelMetadata,
-    save_dir: str = "model_artifacts",
-    export_formats: list = ["torchscript", "onnx"],
-) -> dict:
-    """
-    Package a model with metadata into versioned artifacts.
-    Returns dict of {format: path}.
-    """
-    save_path = Path(save_dir) / metadata.version
-    save_path.mkdir(parents=True, exist_ok=True)
-
-    artifacts = {}
-    model.eval()
-    dummy = torch.randn(*metadata.input_shape)
-
-    # Save TorchScript
-    if "torchscript" in export_formats:
-        with torch.no_grad():
-            traced = torch.jit.trace(model, dummy)
-        ts_path = save_path / "model.pt"
-        traced.save(str(ts_path))
-        artifacts["torchscript"] = str(ts_path)
-
-    # Save ONNX
-    if "onnx" in export_formats:
-        onnx_path = save_path / "model.onnx"
-        with torch.no_grad():
-            torch.onnx.export(
-                model, dummy, str(onnx_path),
-                input_names=["input"], output_names=["output"],
-                opset_version=17,
+try:
+    import torch_tensorrt
+    
+    model = SimpleModel().eval().cuda()
+    
+    # Convert to TensorRT — provides optimal plan for THIS specific GPU
+    trt_model = torch_tensorrt.compile(
+        model,
+        inputs=[
+            torch_tensorrt.Input(
+                min_shape=(1, 784),    # Minimum batch size
+                opt_shape=(32, 784),   # Optimal (most common) batch size
+                max_shape=(128, 784),  # Maximum batch size
+                dtype=torch.float32
             )
-        artifacts["onnx"] = str(onnx_path)
-
-    # Save metadata
-    meta_path = save_path / "metadata.json"
-    with open(meta_path, "w") as f:
-        json.dump(asdict(metadata), f, indent=2)
-
-    print(f"Model artifacts saved to: {save_path}")
-    print(f"  {', '.join(artifacts.keys())}")
-    return artifacts
+        ],
+        enabled_precisions={torch.float16},  # Allow FP16 for speed
+    )
+    
+    # Run TRT inference
+    x = torch.randn(32, 784, device='cuda')
+    with torch.no_grad():
+        out = trt_model(x)
+    print(f"TensorRT output: {out.shape}")
+    
+    # Save TRT engine for later
+    torch.jit.save(trt_model, "model_trt.pt")
+    
+except ImportError:
+    print("torch_tensorrt not installed")
 ```
 
 ---
 
-## 13.7 Inference Warm-Up and Benchmarking
+## Part 5: Benchmarking Inference Correctly
+
+### 5.1 Latency vs Throughput
 
 ```python
 import torch
 import time
-import statistics
 
-class InferenceBenchmark:
-    """Comprehensive inference benchmarking."""
-
-    def __init__(self, model, device, n_warmup: int = 20, n_runs: int = 100):
-        self.model   = model
-        self.device  = device
-        self.n_warmup = n_warmup
-        self.n_runs   = n_runs
-
-    def run(self, input_tensor: torch.Tensor) -> dict:
-        self.model.eval()
-        x = input_tensor.to(self.device)
-
-        # Warmup (fill GPU pipeline, compile any JIT lazily)
+def benchmark_inference(model, input_shape, batch_sizes=[1, 8, 32, 64],
+                         n_warmup=20, n_reps=200, device='cuda'):
+    """
+    Comprehensive inference benchmark.
+    
+    Key concepts:
+    - Latency: time for ONE batch (critical for real-time, interactive)
+    - Throughput: samples/second (critical for batch processing, serving)
+    - Memory: peak GPU memory during inference
+    
+    Common mistakes:
+    1. Not warming up (first few runs include JIT compilation)
+    2. Not using torch.no_grad() (adds gradient tracking overhead)
+    3. Forgetting torch.cuda.synchronize() (GPU is async!)
+    4. Not setting model.eval() (Dropout/BN behave differently)
+    """
+    model = model.to(device).eval()
+    results = {}
+    
+    for batch_size in batch_sizes:
+        x = torch.randn(batch_size, *input_shape, device=device)
+        
+        # Step 1: Warmup
         with torch.no_grad():
-            for _ in range(self.n_warmup):
-                _ = self.model(x)
-        if self.device.type == "cuda":
+            for _ in range(n_warmup):
+                _ = model(x)
+        if device == 'cuda':
+            torch.cuda.synchronize()  # Wait for warmup to finish
+        
+        # Step 2: Track peak memory
+        if device == 'cuda':
+            torch.cuda.reset_peak_memory_stats()
+        
+        # Step 3: Benchmark with CUDA events (most accurate for GPU)
+        if device == 'cuda':
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            
+            start_event.record()
+            with torch.no_grad():
+                for _ in range(n_reps):
+                    _ = model(x)
+            end_event.record()
             torch.cuda.synchronize()
-
-        # Timed runs
-        latencies = []
-        with torch.no_grad():
-            for _ in range(self.n_runs):
-                if self.device.type == "cuda":
-                    start = torch.cuda.Event(enable_timing=True)
-                    end   = torch.cuda.Event(enable_timing=True)
-                    start.record()
-                    _ = self.model(x)
-                    end.record()
-                    torch.cuda.synchronize()
-                    latencies.append(start.elapsed_time(end))
-                else:
-                    t0 = time.perf_counter()
-                    _ = self.model(x)
-                    latencies.append(1000 * (time.perf_counter() - t0))
-
-        return {
-            "p50_ms":  statistics.median(latencies),
-            "p95_ms":  sorted(latencies)[int(0.95 * len(latencies))],
-            "p99_ms":  sorted(latencies)[int(0.99 * len(latencies))],
-            "mean_ms": statistics.mean(latencies),
-            "std_ms":  statistics.stdev(latencies),
-            "throughput_sps": 1000 * x.shape[0] / statistics.median(latencies),
+            
+            total_ms = start_event.elapsed_time(end_event)
+        else:
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                for _ in range(n_reps):
+                    _ = model(x)
+            total_ms = (time.perf_counter() - t0) * 1000
+        
+        latency_ms = total_ms / n_reps
+        throughput = batch_size * n_reps / (total_ms / 1000)
+        
+        if device == 'cuda':
+            peak_mem_mb = torch.cuda.max_memory_allocated() / 1e6
+        else:
+            peak_mem_mb = 0
+        
+        results[batch_size] = {
+            'latency_ms': latency_ms,
+            'throughput': throughput,
+            'peak_mem_mb': peak_mem_mb,
         }
+        
+        print(f"Batch {batch_size:4d}: "
+              f"latency={latency_ms:.2f}ms, "
+              f"throughput={throughput:.0f} samples/s, "
+              f"memory={peak_mem_mb:.0f}MB")
+    
+    return results
+
+# Run benchmark
+model = SimpleModel()
+results = benchmark_inference(model, input_shape=(784,), device='cpu')
 ```
 
 ---
 
-## Exercises
+## Part 6: Model Versioning and Artifact Management
 
-**Exercise 13.1** Export `MiniGPT` (Module 08) to ONNX with dynamic batch and sequence dimensions. Validate that ONNX Runtime output matches PyTorch for batch sizes 1, 4, 16 and sequence lengths 32, 64, 128.
+### 6.1 Production Artifact Structure
 
-**Exercise 13.2** Script the `BiLSTMClassifier` from Module 07 using `torch.jit.script`. Fix any type annotation issues. Benchmark the scripted version vs eager on CPU (100 batches, batch_size=32).
+```python
+import json
+import hashlib
+from pathlib import Path
+from datetime import datetime
 
-**Exercise 13.3** Write a complete `export_pipeline(model, model_name, version)` function that: exports TorchScript + ONNX, validates both, benchmarks all three (eager/TS/ONNX), and writes a JSON report.
+def save_model_artifact(model: torch.nn.Module, save_dir: str,
+                         metadata: dict) -> str:
+    """
+    Save a complete model artifact with reproducibility metadata.
+    
+    A model artifact = model weights + metadata + config + checksums
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save model weights
+    weights_path = save_dir / "model.pt"
+    torch.save(model.state_dict(), weights_path)
+    
+    # Compute checksum for integrity verification
+    with open(weights_path, 'rb') as f:
+        checksum = hashlib.sha256(f.read()).hexdigest()
+    
+    # Save metadata (everything needed to reproduce this model)
+    full_metadata = {
+        "timestamp": datetime.now().isoformat(),
+        "pytorch_version": torch.__version__,
+        "checksum_sha256": checksum,
+        "model_params": sum(p.numel() for p in model.parameters()),
+        **metadata  # User-provided: accuracy, training config, etc.
+    }
+    
+    with open(save_dir / "metadata.json", "w") as f:
+        json.dump(full_metadata, f, indent=2)
+    
+    print(f"Saved artifact to: {save_dir}")
+    print(f"SHA256: {checksum[:16]}...")
+    return checksum
+
+
+# Example artifact metadata
+save_model_artifact(
+    model=SimpleModel(),
+    save_dir="artifacts/resnet50_cifar10_v1.2",
+    metadata={
+        "model_name": "SimpleModel",
+        "dataset": "CIFAR-10",
+        "version": "1.2.0",
+        "val_accuracy": 0.921,
+        "training_epochs": 100,
+        "optimizer": "AdamW",
+        "learning_rate": 3e-4,
+    }
+)
+```
 
 ---
 
-## Module Summary
+## Key Takeaways
 
-| Format | Portability | Speed | Dynamic Shapes | Use Case |
-|--------|------------|-------|---------------|---------|
-| Eager PyTorch | Python only | Baseline | Full | Development |
-| TorchScript | Python + C++ | +10–20% | With scripting | C++ apps |
-| ONNX | All frameworks | +20–50% | Yes | Cross-platform |
-| TensorRT | NVIDIA only | 3–10× | Yes | Max GPU perf |
+| Format | Platform | Speed | Portability | Use Case |
+|--------|----------|-------|-------------|----------|
+| **TorchScript** | PyTorch-compatible | Good | C++, Python | PyTorch serving |
+| **ONNX** | Any ONNX Runtime | Good | Any platform | Cross-platform |
+| **TensorRT** | NVIDIA GPU only | Best | NVIDIA only | Max GPU speed |
+| **ExecuTorch** | Mobile/Edge | Great | iOS, Android | Edge devices |
 
 ---
 
 ## Quiz
 
-1. What is the key difference between `torch.jit.trace` and `torch.jit.script`?
-2. Why does tracing fail for models with data-dependent control flow?
-3. What does `dynamic_axes` do in `torch.onnx.export`?
-4. What is `do_constant_folding=True` and what does it optimise?
-5. What is the ONNX opset version and why does it matter?
-6. Why do you need to warm up the model before benchmarking inference?
-7. What is TensorRT engine calibration and when is it needed?
+1. **What is the key difference between tracing and scripting?**
+   - Answer: Tracing records one execution path; scripting compiles source code and handles all branches
 
----
+2. **When would tracing fail silently?**
+   - Answer: When the model has data-dependent if/else — traced model always takes the branch from the dummy input
 
-*Next: [Module 14 — Serving & Production Systems](./14_serving_and_production.md)*
+3. **What does `dynamic_axes` do in torch.onnx.export?**
+   - Answer: Specifies which dimensions can vary (e.g., batch size) so the ONNX model accepts variable input shapes
+
+4. **What is `do_constant_folding=True`?**
+   - Answer: Pre-computes operations on constants at export time, reducing inference computation
+
+5. **Why must you call `torch.cuda.synchronize()` when timing GPU operations?**
+   - Answer: GPU ops are asynchronous; without synchronize, you measure CPU scheduling time, not GPU execution time
+
+6. **What is latency vs throughput?**
+   - Answer: Latency = time for one batch (real-time requirement); throughput = samples/second (batch processing)
+
+7. **What is TensorRT's main mechanism for speedup?**
+   - Answer: Analyzes the computation graph, fuses operators, selects optimal CUDA kernels for specific GPU, optionally quantizes
+
+8. **Why is warmup needed before benchmarking?**
+   - Answer: First runs include JIT compilation, GPU cache loading; warmup ensures steady-state performance is measured
+
+9. **What is ONNX opset version?**
+   - Answer: The version of ONNX operator specification; higher opsets support more operations but require newer runtimes
+
+10. **Why save a model checksum in production?**
+    - Answer: Verify model file integrity (detect corruption/tampering) and ensure the correct version is deployed

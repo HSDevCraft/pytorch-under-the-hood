@@ -1,565 +1,501 @@
-# Module 01: Tensors & Fundamental Operations
+# Module 01: Tensors & Fundamentals — The Building Blocks of PyTorch
+
+> **Goal:** Understand PyTorch tensors deeply—not just how to use them, but *why* they're designed the way they are and how they differ from NumPy arrays.
+
+---
 
 ## Learning Objectives
-By the end of this module you will be able to:
-- Create tensors using every major factory function
-- Understand the relationship between dtype, device, and shape
-- Perform element-wise, reduction, and matrix operations efficiently
-- Exploit broadcasting rules to write loop-free code
-- Move tensors between CPU and GPU
-- Interoperate seamlessly between PyTorch and NumPy
-- Avoid common memory pitfalls (in-place ops, views vs copies)
+
+By the end of this module, you will:
+- **Understand** what PyTorch tensors are and how they differ from NumPy arrays
+- **Create** tensors in multiple ways and understand tensor properties (shape, dtype, device)
+- **Perform** tensor operations: indexing, slicing, reshaping, broadcasting
+- **Grasp** the concept of **computational graphs** (tensors track operations for backprop)
+- **Know** when to use CPU vs GPU and how to move tensors between devices
+- **Understand** views vs copies and why it matters for memory efficiency
 
 ---
 
-## 1.1 What Is a Tensor?
+## Part 1: What Are PyTorch Tensors?
 
-A **tensor** is a generalization of scalars, vectors, and matrices to arbitrary dimensions (called *rank* or *ndim*):
+### 1.1 Tensors vs NumPy Arrays
 
-| Rank | Name | Shape Example | Real-world Example |
-|------|------|--------------|-------------------|
-| 0 | Scalar | `()` | a single loss value |
-| 1 | Vector | `(128,)` | an embedding |
-| 2 | Matrix | `(32, 512)` | a batch of embeddings |
-| 3 | 3-D tensor | `(32, 3, 224)` | a batch of 1-D signals with 3 channels |
-| 4 | 4-D tensor | `(32, 3, 224, 224)` | a batch of RGB images |
-| 5 | 5-D tensor | `(8, 4, 3, 224, 224)` | a batch of video clips |
+A **PyTorch tensor** is similar to a NumPy array but with crucial differences:
 
-Internally, PyTorch stores tensor data as a contiguous (or strided) block of typed memory, described by:
-- **`dtype`** — the element type (float32, int64, bool, ...)
-- **`device`** — where the data lives (cpu, cuda:0, mps)
-- **`shape`** — sizes along each dimension
-- **`stride`** — how many elements to skip in memory to advance one step along each dimension
+| Feature | NumPy Array | PyTorch Tensor |
+|---------|-------------|----------------|
+| **GPU Support** | CPU only | CPU or GPU |
+| **Automatic Differentiation** | No | Yes (tracks operations) |
+| **Computational Graph** | No | Yes (for backprop) |
+| **Speed** | Good for CPU | Excellent for GPU |
+| **Deep Learning** | Not designed for it | Built for it |
 
----
-
-## 1.2 Creating Tensors
+**Intuition:** Think of a NumPy array as a static container of numbers. A PyTorch tensor is a container that also remembers how it was created—this memory is crucial for computing gradients during backpropagation.
 
 ```python
 import torch
 import numpy as np
 
-# ── From Python data ─────────────────────────────────────────────────────────
-scalar = torch.tensor(3.14)                    # 0-D, float32
-vector = torch.tensor([1, 2, 3])               # 1-D, int64 (inferred)
-matrix = torch.tensor([[1.0, 2.0], [3.0, 4.0]]) # 2-D, float32
+# NumPy array
+np_array = np.array([1, 2, 3])
+print(f"NumPy array: {np_array}")
+print(f"Type: {type(np_array)}")
 
-# ── Factory functions ────────────────────────────────────────────────────────
-zeros   = torch.zeros(3, 4)           # all zeros, shape (3, 4)
-ones    = torch.ones(2, 5)            # all ones
-full    = torch.full((2, 3), fill_value=7.0)  # filled with 7
-eye     = torch.eye(4)                # 4×4 identity matrix
-arange  = torch.arange(0, 10, 2)     # [0, 2, 4, 6, 8]
-linspace= torch.linspace(0, 1, steps=5)  # [0.0, 0.25, 0.5, 0.75, 1.0]
+# PyTorch tensor
+torch_tensor = torch.tensor([1, 2, 3])
+print(f"PyTorch tensor: {torch_tensor}")
+print(f"Type: {type(torch_tensor)}")
 
-# ── Random tensors ───────────────────────────────────────────────────────────
-torch.manual_seed(42)                 # reproducibility
-uniform = torch.rand(3, 4)            # U[0, 1)
-normal  = torch.randn(3, 4)           # N(0, 1)
-randint = torch.randint(0, 10, (3, 4)) # integers in [0, 10)
-perm    = torch.randperm(10)          # random permutation of 0..9
-
-# ── Like-other-tensor factories ──────────────────────────────────────────────
-x = torch.randn(3, 4)
-z = torch.zeros_like(x)   # same shape, dtype, device; filled with 0
-o = torch.ones_like(x)
-r = torch.rand_like(x)
-
-# ── Specifying dtype and device ──────────────────────────────────────────────
-f16 = torch.zeros(3, 4, dtype=torch.float16)
-i32 = torch.zeros(3, 4, dtype=torch.int32)
-gpu = torch.ones(2, 2, device="cuda")   # directly on GPU
-
-# ── From NumPy (zero-copy when dtype matches) ─────────────────────────────────
-arr = np.array([1.0, 2.0, 3.0])
-t   = torch.from_numpy(arr)             # shares memory!
-t2  = torch.tensor(arr)                 # COPIES data
-
-# Danger: shared memory
-arr[0] = 99.0
-print(t[0])   # 99.0 — they share the same buffer
-print(t2[0])  # 1.0  — independent copy
-
-# ── Back to NumPy ────────────────────────────────────────────────────────────
-back = t.numpy()                        # zero-copy, CPU tensors only
+# Convert between them
+np_to_torch = torch.from_numpy(np_array)
+torch_to_np = torch_tensor.numpy()
 ```
 
-### dtype Reference
-
-| PyTorch dtype | NumPy equivalent | Bits | Notes |
-|--------------|-----------------|------|-------|
-| `torch.float32` | `float32` | 32 | Default for model parameters |
-| `torch.float64` | `float64` | 64 | High-precision math |
-| `torch.float16` | `float16` | 16 | Mixed precision (GPU) |
-| `torch.bfloat16` | — | 16 | Better range than fp16 (TPU/Ampere+) |
-| `torch.int64` | `int64` | 64 | Default for integer tensors; class indices |
-| `torch.int32` | `int32` | 32 | |
-| `torch.bool` | `bool` | 1 | Masks, conditions |
-
----
-
-## 1.3 Inspecting Tensors
+### 1.2 Creating Tensors
 
 ```python
-x = torch.randn(4, 3, 32, 32)
+# ── From Python lists ──────────────────────────────────────────────────────────
+t1 = torch.tensor([1, 2, 3])
+t2 = torch.tensor([[1, 2], [3, 4]])  # 2D tensor
 
-print(x.shape)         # torch.Size([4, 3, 32, 32])
-print(x.size())        # same as shape
-print(x.ndim)          # 4 (number of dimensions)
-print(x.dtype)         # torch.float32
-print(x.device)        # device(type='cpu')
-print(x.requires_grad) # False
-print(x.is_contiguous())  # True
-print(x.numel())       # 4 * 3 * 32 * 32 = 12288 elements
-print(x.element_size()) # 4 bytes (float32)
-print(x.nbytes)        # 12288 * 4 = 49152 bytes
+# ── From NumPy arrays ─────────────────────────────────────────────────────────
+np_arr = np.array([1, 2, 3])
+t3 = torch.from_numpy(np_arr)  # Shares memory with NumPy array!
 
-# Memory layout (strides)
-print(x.stride())      # (3072, 1024, 32, 1)
-# To advance 1 step along dim-0: skip 3*32*32 = 3072 elements in memory
-```
+# ── Common initializations ────────────────────────────────────────────────────
+zeros = torch.zeros(3, 4)      # 3×4 matrix of zeros
+ones = torch.ones(2, 5)        # 2×5 matrix of ones
+random = torch.rand(3, 3)      # Random values in [0, 1)
+randn = torch.randn(3, 3)      # Random from normal distribution
+arange = torch.arange(0, 10, 2) # [0, 2, 4, 6, 8]
+linspace = torch.linspace(0, 1, 5) # [0, 0.25, 0.5, 0.75, 1]
 
----
+# ── Specify data type ──────────────────────────────────────────────────────────
+t_int = torch.tensor([1, 2, 3], dtype=torch.int32)
+t_float = torch.tensor([1, 2, 3], dtype=torch.float32)
+t_double = torch.tensor([1, 2, 3], dtype=torch.float64)
 
-## 1.4 Indexing & Slicing
-
-```python
-x = torch.arange(24).reshape(4, 6)  # shape (4, 6)
-# tensor([[ 0,  1,  2,  3,  4,  5],
-#         [ 6,  7,  8,  9, 10, 11],
-#         [12, 13, 14, 15, 16, 17],
-#         [18, 19, 20, 21, 22, 23]])
-
-# Basic slicing (returns a VIEW, not a copy)
-print(x[0])           # first row: tensor([0, 1, 2, 3, 4, 5])
-print(x[:, 0])        # first column: tensor([0, 6, 12, 18])
-print(x[1:3, 2:5])    # submatrix rows 1-2, cols 2-4
-
-# Negative indexing
-print(x[-1])          # last row
-print(x[:, -2:])      # last 2 columns
-
-# Step slicing
-print(x[::2])         # every other row (rows 0, 2)
-print(x[:, ::3])      # every 3rd column (cols 0, 3)
-
-# ── Integer / Fancy indexing (returns a COPY) ────────────────────────────────
-rows = torch.tensor([0, 2])
-cols = torch.tensor([1, 4])
-print(x[rows, cols])  # elements (0,1) and (2,4): tensor([1, 16])
-
-# ── Boolean mask indexing ────────────────────────────────────────────────────
-mask = x > 10
-print(x[mask])        # 1-D tensor of all elements > 10
-
-# ── torch.where ─────────────────────────────────────────────────────────────
-result = torch.where(x % 2 == 0, x, torch.zeros_like(x))  # even or 0
-```
-
----
-
-## 1.5 Reshaping Operations
-
-```python
-x = torch.arange(12)  # shape (12,)
-
-# reshape: returns a view when possible
-y = x.reshape(3, 4)         # (3, 4)
-z = x.reshape(2, 2, 3)      # (2, 2, 3)
-flat = y.reshape(-1)         # -1 is inferred: (12,)
-auto = y.reshape(6, -1)      # -1 inferred: (6, 2)
-
-# view: ALWAYS returns a view; fails if non-contiguous
-w = x.view(4, 3)
-
-# contiguous + view pattern
-t = x.T                      # transpose — non-contiguous
-t_contig = t.contiguous()    # makes a fresh copy that IS contiguous
-v = t_contig.view(-1)        # now safe
-
-# squeeze / unsqueeze
-a = torch.randn(1, 3, 1, 4)
-print(a.squeeze().shape)     # (3, 4) — removes all size-1 dims
-print(a.squeeze(0).shape)    # (3, 1, 4) — removes dim 0 only
-b = torch.randn(3, 4)
-print(b.unsqueeze(0).shape)  # (1, 3, 4) — inserts dim at position 0
-print(b.unsqueeze(-1).shape) # (3, 4, 1)
-
-# flatten (equivalent to reshape(-1) but more explicit)
-img = torch.randn(32, 3, 28, 28)
-flat = img.flatten(start_dim=1)  # (32, 3*28*28) = (32, 2352)
-
-# permute: reorder dimensions
-x = torch.randn(32, 224, 224, 3)     # NHWC format
-x_chw = x.permute(0, 3, 1, 2)        # NCHW: (32, 3, 224, 224)
-```
-
----
-
-## 1.6 Arithmetic Operations
-
-```python
-a = torch.tensor([1.0, 2.0, 3.0])
-b = torch.tensor([4.0, 5.0, 6.0])
-
-# Element-wise ops — functional style
-print(torch.add(a, b))          # [5, 7, 9]
-print(torch.sub(a, b))          # [-3, -3, -3]
-print(torch.mul(a, b))          # [4, 10, 18]
-print(torch.div(a, b))          # [0.25, 0.4, 0.5]
-print(torch.pow(a, 2))          # [1, 4, 9]
-
-# Operator overloads (identical behavior)
-print(a + b)
-print(a - b)
-print(a * b)
-print(a / b)
-print(a ** 2)
-
-# In-place operations (suffix _)
-a.add_(b)         # modifies a IN PLACE; equivalent to a += b
-a.mul_(2.0)       # a *= 2.0 in place
-
-# WARNING: avoid in-place on tensors that have requires_grad=True
-# or that are part of a computation graph — it can corrupt gradients.
-
-# Reduction operations
-x = torch.randn(4, 6)
-print(x.sum())              # scalar sum of all elements
-print(x.sum(dim=0))         # sum along rows → shape (6,)
-print(x.sum(dim=1))         # sum along cols → shape (4,)
-print(x.sum(dim=1, keepdim=True))  # shape (4, 1)  ← keepdim!
-
-print(x.mean())
-print(x.std())
-print(x.max())
-print(x.min())
-print(x.argmax(dim=1))      # index of max along dim 1
-print(x.topk(3, dim=1))     # top 3 values and indices along dim 1
-
-# Cumulative ops
-v = torch.tensor([1.0, 2.0, 3.0, 4.0])
-print(v.cumsum(dim=0))      # [1, 3, 6, 10]
-print(v.cumprod(dim=0))     # [1, 2, 6, 24]
-```
-
----
-
-## 1.7 Matrix Operations
-
-```python
-A = torch.randn(4, 3)
-B = torch.randn(3, 5)
-
-# Matrix multiplication
-C = torch.mm(A, B)           # (4, 3) @ (3, 5) → (4, 5)
-C = A @ B                    # same, using @ operator (preferred)
-
-# Batched matrix multiply
-batch_A = torch.randn(32, 4, 3)  # 32 matrices of shape (4, 3)
-batch_B = torch.randn(32, 3, 5)
-batch_C = torch.bmm(batch_A, batch_B)  # (32, 4, 5)
-# or equivalently with broadcasting:
-batch_C = batch_A @ batch_B
-
-# Einstein summation notation (extremely expressive)
-# Equivalent to mm:
-C = torch.einsum("ij,jk->ik", A, B)
-# Batched matrix multiply:
-D = torch.einsum("bij,bjk->bik", batch_A, batch_B)
-# Dot product:
-dot = torch.einsum("i,i->", a, b)
-# Outer product:
-outer = torch.einsum("i,j->ij", a, b)
-
-# Transpose
-At = A.T        # or A.transpose(0, 1)
-At = A.mT       # batch-aware transpose (transposes last 2 dims)
-
-# Useful matrix operations
-sym = A.T @ A                        # symmetric matrix (3, 3)
-vals, vecs = torch.linalg.eig(sym.float())   # eigendecomposition
-inv  = torch.linalg.inv(sym)         # matrix inverse
-det  = torch.linalg.det(sym)         # determinant
-norm = torch.linalg.norm(A, ord="fro")  # Frobenius norm
-U, S, Vh = torch.linalg.svd(A, full_matrices=False)  # SVD
-```
-
----
-
-## 1.8 Broadcasting
-
-Broadcasting lets you do arithmetic on tensors with different shapes **without copying data**. PyTorch follows NumPy's broadcasting rules:
-
-**Rules (applied right-to-left on dimensions):**
-1. If tensors don't have the same number of dims, prepend 1s to the smaller shape.
-2. Dimensions of size 1 are expanded to match the other tensor.
-3. If sizes differ and neither is 1, it's an error.
-
-```python
-# Example 1: add bias to every row of a matrix
-x = torch.randn(32, 512)   # (32, 512)
-b = torch.randn(512)        # (512,)  → broadcast to (32, 512)
-out = x + b                 # (32, 512) — no copy of b!
-
-# Example 2: scale each channel in a NCHW image batch
-imgs = torch.randn(8, 3, 224, 224)  # (8, 3, 224, 224)
-scale = torch.tensor([0.229, 0.224, 0.225])  # (3,)
-# need shape (1, 3, 1, 1) for broadcasting
-scale = scale.view(1, 3, 1, 1)
-normalized = imgs / scale
-
-# Example 3: pairwise distance matrix (n points in d dims)
-X = torch.randn(100, 64)   # (100, 64)
-# ‖X_i - X_j‖² = ‖X_i‖² - 2 X_i·X_j + ‖X_j‖²
-sq_norms = (X * X).sum(dim=1, keepdim=True)  # (100, 1)
-dists = sq_norms + sq_norms.T - 2 * (X @ X.T)  # (100, 100)
-
-# Visualize broadcasting shapes
-import torch
-a = torch.randn(4, 1, 6)
-b = torch.randn(   3, 6)
-c = a + b   # shapes: (4, 1, 6) + (1, 3, 6) → (4, 3, 6)
-print(c.shape)  # torch.Size([4, 3, 6])
-```
-
----
-
-## 1.9 Device Management
-
-```python
-# ── Select the best available device ─────────────────────────────────────────
-def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-device = get_device()
-print(device)  # e.g. device(type='cuda')
-
-# ── Moving tensors ────────────────────────────────────────────────────────────
-x = torch.randn(3, 4)           # on CPU
-x_gpu = x.to(device)            # move to GPU
-x_gpu = x.cuda()                # shorthand (CUDA only)
-x_back = x_gpu.cpu()            # move back to CPU
-x_fp16 = x.to(device, dtype=torch.float16)  # move and cast in one call
-
-# ── Multi-GPU: specify device index ──────────────────────────────────────────
-if torch.cuda.device_count() > 1:
-    x_gpu1 = x.to("cuda:1")
-
-# ── Pin memory for fast host→device transfer ──────────────────────────────────
-# Used in DataLoaders
-x_pinned = x.pin_memory()       # page-locked CPU memory
-
-# ── CUDA memory inspection ────────────────────────────────────────────────────
+# ── Create on GPU (if available) ───────────────────────────────────────────────
 if torch.cuda.is_available():
-    print(torch.cuda.memory_allocated() / 1e6, "MB allocated")
-    print(torch.cuda.memory_reserved() / 1e6,  "MB reserved")
-    torch.cuda.empty_cache()    # release cached but unused memory
-
-# ── Best practice: always use .to(device) not .cuda() ────────────────────────
-# This makes your code hardware-agnostic
-model = MyModel().to(device)
-batch = batch.to(device)
+    t_gpu = torch.tensor([1, 2, 3], device='cuda')
+    print(f"Tensor device: {t_gpu.device}")
 ```
 
----
-
-## 1.10 Views vs Copies
-
-Understanding when PyTorch shares memory is critical:
+### 1.3 Tensor Properties
 
 ```python
-x = torch.arange(12).reshape(3, 4)
+t = torch.randn(2, 3, 4)  # 3D tensor
 
-# These SHARE memory (views):
-v1 = x[0]            # first row — view
-v2 = x[:, :2]        # column slice — view
-v3 = x.view(2, 6)    # reshape — view
-v4 = x.t()           # transpose — view (non-contiguous!)
+# Shape: dimensions of the tensor
+print(f"Shape: {t.shape}")  # torch.Size([2, 3, 4])
+print(f"Shape[0]: {t.shape[0]}")  # 2
 
-# These CREATE a copy:
-c1 = x.clone()              # always copies, preserves grad_fn
-c2 = x.detach().clone()     # copies, detached from computation graph
-c3 = x[torch.tensor([0,2])] # fancy indexing — copy
+# Size: same as shape
+print(f"Size: {t.size()}")  # torch.Size([2, 3, 4])
 
-# Verify sharing
-v1[0] = 999
-print(x[0, 0])  # 999 — they share data
+# Number of dimensions
+print(f"Ndim: {t.ndim}")  # 3
 
-# Check if a tensor is a view
-print(x.storage().data_ptr() == v1.storage().data_ptr())  # True
+# Total number of elements
+print(f"Numel: {t.numel()}")  # 2*3*4 = 24
 
-# is_leaf check (important for autograd)
-w = torch.randn(3, 3, requires_grad=True)
-print(w.is_leaf)   # True — created by user
-y = w * 2
-print(y.is_leaf)   # False — result of an operation
+# Data type
+print(f"Dtype: {t.dtype}")  # torch.float32
+
+# Device (CPU or GPU)
+print(f"Device: {t.device}")  # cpu
+
+# Requires gradient? (for backprop)
+print(f"Requires grad: {t.requires_grad}")  # False
 ```
 
 ---
 
-## 1.11 Concatenating & Stacking
+## Part 2: Tensor Operations
+
+### 2.1 Indexing and Slicing
 
 ```python
-a = torch.randn(3, 4)
-b = torch.randn(3, 4)
+t = torch.arange(12).reshape(3, 4)
+# [[0, 1, 2, 3],
+#  [4, 5, 6, 7],
+#  [8, 9, 10, 11]]
 
-# cat: concatenate along an EXISTING dimension
-h = torch.cat([a, b], dim=0)   # (6, 4) — stack vertically
-w = torch.cat([a, b], dim=1)   # (3, 8) — stack horizontally
+# ── Single element ─────────────────────────────────────────────────────────────
+print(t[0, 1])  # 1 (row 0, column 1)
+print(t[2, 3])  # 11
 
-# stack: creates a NEW dimension
-s = torch.stack([a, b], dim=0)  # (2, 3, 4)
-s = torch.stack([a, b], dim=1)  # (3, 2, 4)
+# ── Rows and columns ───────────────────────────────────────────────────────────
+print(t[0])     # [0, 1, 2, 3] (first row)
+print(t[:, 0])  # [0, 4, 8] (first column)
 
-# chunk / split: the inverse of cat
-parts = torch.chunk(h, chunks=3, dim=0)   # 3 tensors of shape (2, 4)
-p1, p2 = torch.split(h, split_size_or_sections=3, dim=0)  # (3,4) each
+# ── Slicing ────────────────────────────────────────────────────────────────────
+print(t[1:3])   # Rows 1-2 (row 3 excluded)
+print(t[:, 1:3]) # Columns 1-2
+
+# ── Negative indexing ──────────────────────────────────────────────────────────
+print(t[-1])    # Last row
+print(t[-1, -1]) # Last element
+
+# ── Step slicing ───────────────────────────────────────────────────────────────
+print(t[::2])   # Every 2nd row
+print(t[:, ::2]) # Every 2nd column
 ```
 
----
-
-## 1.12 Real-World Use Case: Image Preprocessing Pipeline
+### 2.2 Reshaping and Viewing
 
 ```python
-import torch
-import torchvision.transforms.functional as TF
+t = torch.arange(12)  # [0, 1, 2, ..., 11]
 
-def preprocess_image_batch(
-    images: list,           # list of PIL images
-    target_size: tuple = (224, 224),
-    mean: tuple = (0.485, 0.456, 0.406),  # ImageNet stats
-    std:  tuple = (0.229, 0.224, 0.225),
-    device: torch.device = torch.device("cpu"),
-) -> torch.Tensor:
-    """
-    Convert a list of PIL images to a normalized tensor batch.
-    Returns: (N, C, H, W) float32 tensor on `device`.
-    """
-    tensors = []
-    for img in images:
-        # Resize → to tensor (scales to [0,1]) → normalize
-        img = TF.resize(img, list(target_size))
-        t   = TF.to_tensor(img)            # (3, H, W), float32, [0,1]
-        t   = TF.normalize(t, mean, std)   # (3, H, W), zero-centred
-        tensors.append(t)
+# ── Reshape: change shape, same data ───────────────────────────────────────────
+t_reshaped = t.reshape(3, 4)  # 3×4 matrix
+print(t_reshaped.shape)  # torch.Size([3, 4])
 
-    batch = torch.stack(tensors, dim=0)    # (N, 3, H, W)
-    return batch.to(device, non_blocking=True)
+# Reshape to 1D
+t_flat = t_reshaped.reshape(-1)  # -1 means "infer this dimension"
+print(t_flat.shape)  # torch.Size([12])
 
-# Inverse: denormalize for visualization
-def denormalize(
-    tensor: torch.Tensor,
-    mean=(0.485, 0.456, 0.406),
-    std =(0.229, 0.224, 0.225),
-) -> torch.Tensor:
-    mean_t = torch.tensor(mean).view(1, 3, 1, 1)
-    std_t  = torch.tensor(std).view(1, 3, 1, 1)
-    return (tensor * std_t + mean_t).clamp(0, 1)
+# ── View: create a view (shares memory) ────────────────────────────────────────
+t_view = t.view(3, 4)  # Same as reshape, but requires contiguous memory
+print(t_view.shape)  # torch.Size([3, 4])
+
+# ── Squeeze: remove dimensions of size 1 ───────────────────────────────────────
+t_1d = torch.tensor([1, 2, 3])
+t_unsqueezed = t_1d.unsqueeze(0)  # Add dimension at position 0
+print(t_unsqueezed.shape)  # torch.Size([1, 3])
+
+t_squeezed = t_unsqueezed.squeeze()  # Remove dimensions of size 1
+print(t_squeezed.shape)  # torch.Size([3])
+
+# ── Transpose: swap dimensions ────────────────────────────────────────────────
+t_2d = torch.arange(6).reshape(2, 3)
+t_transposed = t_2d.T  # or t_2d.transpose(0, 1)
+print(t_transposed.shape)  # torch.Size([3, 2])
+```
+
+### 2.3 Arithmetic Operations
+
+```python
+a = torch.tensor([1, 2, 3])
+b = torch.tensor([4, 5, 6])
+
+# ── Element-wise operations ────────────────────────────────────────────────────
+add = a + b  # [5, 7, 9]
+sub = a - b  # [-3, -3, -3]
+mul = a * b  # [4, 10, 18]
+div = a / b  # [0.25, 0.4, 0.5]
+pow = a ** 2  # [1, 4, 9]
+
+# ── In-place operations (modify tensor in place) ────────────────────────────────
+a_copy = a.clone()
+a_copy += 10  # a_copy becomes [11, 12, 13]
+a_copy *= 2   # a_copy becomes [22, 24, 26]
+
+# ── Dot product and matrix multiplication ──────────────────────────────────────
+dot = torch.dot(a, b)  # 1*4 + 2*5 + 3*6 = 32
+
+A = torch.arange(6).reshape(2, 3)  # [[0, 1, 2], [3, 4, 5]]
+B = torch.arange(6).reshape(3, 2)  # [[0, 1], [2, 3], [4, 5]]
+C = A @ B  # Matrix multiplication
+# [[0*0+1*2+2*4, 0*1+1*3+2*5],
+#  [3*0+4*2+5*4, 3*1+4*3+5*5]]
+# = [[10, 13], [28, 40]]
+```
+
+### 2.4 Broadcasting
+
+**Broadcasting** is the automatic expansion of tensor shapes to make operations compatible.
+
+```python
+# ── Broadcasting rules ────────────────────────────────────────────────────────
+# When operating on two tensors, PyTorch compares shapes element-wise.
+# Two dimensions are compatible when:
+#   1. They are equal, or
+#   2. One of them is 1 (the 1 is "broadcast" to match the other)
+
+# Example 1: Scalar with tensor
+a = torch.tensor([1, 2, 3])
+b = 2
+c = a + b  # [3, 4, 5] (scalar 2 is broadcast to [2, 2, 2])
+
+# Example 2: Different shapes
+a = torch.arange(6).reshape(2, 3)  # shape (2, 3)
+b = torch.arange(3)  # shape (3,)
+c = a + b  # b is broadcast to (2, 3)
+# [[0, 1, 2],    [[0, 1, 2],
+#  [3, 4, 5]]  +  [0, 1, 2]]  = [[0, 2, 4], [3, 5, 7]]
+
+# Example 3: Column vector with row vector
+col = torch.arange(3).reshape(3, 1)  # shape (3, 1)
+row = torch.arange(4)  # shape (4,)
+result = col + row  # Broadcast to (3, 4)
+# [[0],      [[0, 1, 2, 3],
+#  [1],   +   [0, 1, 2, 3]]  = [[0, 1, 2, 3], [1, 2, 3, 4], [2, 3, 4, 5]]
+#  [2]]
 ```
 
 ---
 
-## 1.13 Best Practices
+## Part 3: Device Management (CPU vs GPU)
 
-| Practice | Why |
-|----------|-----|
-| Use `torch.manual_seed(seed)` + `torch.cuda.manual_seed_all(seed)` | Reproducibility |
-| Prefer `x.to(device)` over `x.cuda()` | Hardware-agnostic code |
-| Use `keepdim=True` in reductions when you need broadcasting downstream | Avoid shape bugs |
-| Avoid Python loops over tensor elements; use vectorized ops | 100–1000× faster |
-| Use `torch.no_grad()` for inference | Saves memory, disables grad tracking |
-| Call `.detach()` before `.numpy()` on grad-tracked tensors | Prevents errors |
-| Use `.clone()` when you need an independent copy | Prevents accidental aliasing |
-| Prefer `@` over `torch.mm` | Works for any number of batch dims |
+### 3.1 Understanding Devices
+
+```python
+# Check if GPU is available
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"CUDA device count: {torch.cuda.device_count()}")
+if torch.cuda.is_available():
+    print(f"Current GPU: {torch.cuda.get_device_name(0)}")
+
+# Create tensors on different devices
+t_cpu = torch.tensor([1, 2, 3], device='cpu')
+if torch.cuda.is_available():
+    t_gpu = torch.tensor([1, 2, 3], device='cuda')
+    print(f"CPU tensor device: {t_cpu.device}")
+    print(f"GPU tensor device: {t_gpu.device}")
+```
+
+### 3.2 Moving Tensors Between Devices
+
+```python
+t = torch.tensor([1, 2, 3])
+
+# Move to GPU
+if torch.cuda.is_available():
+    t_gpu = t.to('cuda')
+    print(f"Tensor on GPU: {t_gpu.device}")
+
+    # Move back to CPU
+    t_cpu = t_gpu.to('cpu')
+    print(f"Tensor on CPU: {t_cpu.device}")
+
+# Alternative syntax
+if torch.cuda.is_available():
+    t_gpu = t.cuda()  # Move to GPU
+    t_cpu = t_gpu.cpu()  # Move to CPU
+```
+
+### 3.3 Why GPU Matters
+
+```python
+import time
+
+# Create large tensors
+size = 10000
+a = torch.randn(size, size)
+b = torch.randn(size, size)
+
+# CPU computation
+start = time.time()
+c_cpu = a @ b
+cpu_time = time.time() - start
+print(f"CPU time: {cpu_time:.4f}s")
+
+# GPU computation (if available)
+if torch.cuda.is_available():
+    a_gpu = a.cuda()
+    b_gpu = b.cuda()
+    
+    # Warm up GPU
+    _ = a_gpu @ b_gpu
+    
+    # Time GPU computation
+    torch.cuda.synchronize()  # Wait for GPU to finish
+    start = time.time()
+    c_gpu = a_gpu @ b_gpu
+    torch.cuda.synchronize()
+    gpu_time = time.time() - start
+    print(f"GPU time: {gpu_time:.4f}s")
+    print(f"Speedup: {cpu_time / gpu_time:.1f}x")
+```
+
+---
+
+## Part 4: Views vs Copies
+
+### 4.1 Understanding Memory Sharing
+
+```python
+# ── View: shares memory ────────────────────────────────────────────────────────
+t = torch.arange(12)
+t_view = t.view(3, 4)
+
+# Modify the view
+t_view[0, 0] = 999
+
+# Original tensor is also modified!
+print(t[0])  # 999 (first element changed)
+
+# ── Clone: creates a copy ────────────────────────────────────────────────────────
+t = torch.arange(12)
+t_clone = t.clone()
+
+# Modify the clone
+t_clone[0] = 999
+
+# Original tensor is NOT modified
+print(t[0])  # 0 (unchanged)
+```
+
+### 4.2 Contiguity
+
+```python
+# Views require contiguous memory
+t = torch.arange(12).reshape(3, 4)
+print(f"Is contiguous: {t.is_contiguous()}")  # True
+
+# Transpose creates non-contiguous tensor
+t_transposed = t.T
+print(f"Is contiguous: {t_transposed.is_contiguous()}")  # False
+
+# Can't view a non-contiguous tensor
+# t_transposed.view(-1)  # Error!
+
+# Solution: make it contiguous first
+t_contiguous = t_transposed.contiguous()
+t_flat = t_contiguous.view(-1)  # Now works
+```
+
+---
+
+## Part 5: Computational Graphs (Preview)
+
+### 5.1 Tensors Track Operations
+
+This is the key difference from NumPy: PyTorch tensors can track how they were created.
+
+```python
+# Create tensors that require gradients
+x = torch.tensor([2.0, 3.0], requires_grad=True)
+y = torch.tensor([4.0, 5.0], requires_grad=True)
+
+# Perform operations
+z = x + y
+w = z * 2
+
+print(f"z: {z}")
+print(f"w: {w}")
+
+# The computational graph is:
+# x → (+) → z → (*2) → w
+# y →(+)↗
+
+# We can compute gradients (more on this in Module 02)
+loss = w.sum()
+loss.backward()
+
+print(f"Gradient of x: {x.grad}")
+print(f"Gradient of y: {y.grad}")
+```
+
+**Intuition:** PyTorch remembers the chain of operations. When you call `.backward()`, it uses the chain rule to compute gradients automatically.
+
+---
+
+## Part 6: Common Tensor Operations
+
+### 6.1 Aggregation Functions
+
+```python
+t = torch.arange(12).reshape(3, 4)
+
+# Sum all elements
+total = t.sum()  # 66
+
+# Sum along axis
+row_sums = t.sum(dim=1)  # Sum each row
+col_sums = t.sum(dim=0)  # Sum each column
+
+# Mean, std, min, max
+mean = t.mean()
+std = t.std()
+min_val = t.min()
+max_val = t.max()
+
+# Argmax: index of maximum value
+max_idx = t.argmax()  # 11 (index of value 11)
+max_idx_per_row = t.argmax(dim=1)  # [3, 3, 3] (max index in each row)
+```
+
+### 6.2 Useful Functions
+
+```python
+t = torch.tensor([1.5, -2.3, 0.0, 3.7])
+
+# Absolute value
+abs_t = torch.abs(t)
+
+# Square root
+sqrt_t = torch.sqrt(torch.abs(t))
+
+# Exponential and logarithm
+exp_t = torch.exp(t)
+log_t = torch.log(torch.abs(t) + 1e-8)  # Add small value to avoid log(0)
+
+# Trigonometric
+sin_t = torch.sin(t)
+cos_t = torch.cos(t)
+
+# Activation functions (more on these in Module 03)
+relu_t = torch.relu(t)  # max(0, x)
+sigmoid_t = torch.sigmoid(t)  # 1 / (1 + exp(-x))
+tanh_t = torch.tanh(t)  # (exp(x) - exp(-x)) / (exp(x) + exp(-x))
+```
+
+---
+
+## Key Takeaways
+
+| Concept | Why It Matters |
+|---------|----------------|
+| **Tensors vs Arrays** | Tensors track operations for automatic differentiation |
+| **Shape & Size** | Understanding tensor dimensions is crucial for debugging |
+| **Indexing & Slicing** | Core operations for data manipulation |
+| **Broadcasting** | Enables efficient operations on different-shaped tensors |
+| **Device Management** | GPU acceleration requires moving tensors to GPU |
+| **Views vs Copies** | Views save memory but share data; copies are independent |
+| **Computational Graphs** | Foundation for backpropagation and automatic differentiation |
 
 ---
 
 ## Exercises
 
-**Exercise 1.1** Create a tensor of shape `(5, 5)` where element `[i, j]` = `i * j`. Do this without Python loops.
-
-**Exercise 1.2** Write a function `normalize(x)` that standardizes a 2-D tensor (zero mean, unit variance per column) using only PyTorch tensor ops.
-
-**Exercise 1.3** Given `x = torch.randn(100, 64)`, compute the pairwise cosine similarity matrix of shape `(100, 100)` using broadcasting (no loops).
-
-**Exercise 1.4** Implement batch-wise softmax (`dim=-1`) from scratch using only `torch.exp`, `torch.sum`, and broadcasting. Verify against `torch.softmax`.
-
-**Exercise 1.5** Write a function that takes a 4-D image batch `(N, C, H, W)` and applies random horizontal flipping to each image independently using tensor ops.
-
-<details>
-<summary>Solutions</summary>
-
-```python
-# 1.1
-i = torch.arange(5).unsqueeze(1)  # (5, 1)
-j = torch.arange(5).unsqueeze(0)  # (1, 5)
-result = i * j                     # (5, 5) via broadcasting
-
-# 1.2
-def normalize(x: torch.Tensor) -> torch.Tensor:
-    mean = x.mean(dim=0, keepdim=True)   # (1, F)
-    std  = x.std(dim=0, keepdim=True)    # (1, F)
-    return (x - mean) / (std + 1e-8)
-
-# 1.3
-def cosine_similarity_matrix(X: torch.Tensor) -> torch.Tensor:
-    norms = X.norm(dim=1, keepdim=True)          # (100, 1)
-    X_norm = X / (norms + 1e-8)                  # (100, 64)
-    return X_norm @ X_norm.T                      # (100, 100)
-
-# 1.4
-def my_softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    x_shifted = x - x.max(dim=dim, keepdim=True).values  # numerical stability
-    exp_x = torch.exp(x_shifted)
-    return exp_x / exp_x.sum(dim=dim, keepdim=True)
-
-# Verify
-x = torch.randn(4, 10)
-assert torch.allclose(my_softmax(x), torch.softmax(x, dim=-1), atol=1e-6)
-
-# 1.5
-def random_hflip(batch: torch.Tensor, p: float = 0.5) -> torch.Tensor:
-    N = batch.shape[0]
-    flip_mask = torch.rand(N) < p         # (N,)  bool
-    flipped = batch.clone()
-    flipped[flip_mask] = batch[flip_mask].flip(dims=[-1])  # flip W dim
-    return flipped
-```
-
-</details>
-
----
-
-## Module Summary
-
-| Concept | Key Points |
-|---------|-----------|
-| Tensor creation | `torch.tensor`, `zeros/ones/rand/randn`, `arange/linspace`, `*_like` |
-| Shape manipulation | `reshape`, `view`, `squeeze/unsqueeze`, `permute`, `flatten` |
-| Indexing | slices → views; fancy/bool indexing → copies |
-| Broadcasting | align shapes from the right; size-1 dims expand |
-| Matrix ops | `@`, `bmm`, `einsum`, `torch.linalg.*` |
-| Device mgmt | `.to(device)` is the idiomatic way to move tensors |
-| Memory | views share storage; `.clone()` for independent copies |
+1. Create a 4×5 tensor of random values. Extract the middle 2×3 submatrix.
+2. Create two tensors of shape (3, 4) and (4, 5). Multiply them using matrix multiplication.
+3. Create a tensor and verify that transposing twice gives the original tensor.
+4. Demonstrate broadcasting by adding a (3, 1) tensor to a (1, 4) tensor.
+5. Create a tensor on GPU (if available) and move it back to CPU.
 
 ---
 
 ## Quiz
 
-1. What is the shape of `torch.randn(2, 3).unsqueeze(1)`?
-2. Why does `x.T.view(-1)` sometimes raise an error?
-3. What is the difference between `torch.cat` and `torch.stack`?
-4. Given shapes `(3, 1, 5)` and `(1, 4, 5)`, what is the broadcast result shape?
-5. What does `keepdim=True` do in `x.sum(dim=1, keepdim=True)`?
-6. Why is `torch.from_numpy(arr)` potentially dangerous?
-7. What is a stride in the context of tensor memory layout?
-8. When would you use `einsum` over `@`?
+1. **What is the main difference between a PyTorch tensor and a NumPy array?**
+   - Answer: PyTorch tensors support automatic differentiation and GPU acceleration
 
----
+2. **How do you create a 3×4 tensor of zeros?**
+   - Answer: `torch.zeros(3, 4)`
 
-*Next: [Module 02 — Autograd & Computation Graphs](./02_autograd_and_computation_graphs.md)*
+3. **What does `t.shape` return?**
+   - Answer: A `torch.Size` object containing the dimensions of the tensor
+
+4. **What is broadcasting?**
+   - Answer: Automatic expansion of tensor shapes to make operations compatible
+
+5. **How do you move a tensor to GPU?**
+   - Answer: `t.to('cuda')` or `t.cuda()`
+
+6. **What is the difference between `.view()` and `.reshape()`?**
+   - Answer: `.view()` requires contiguous memory; `.reshape()` handles non-contiguous tensors
+
+7. **What does `requires_grad=True` do?**
+   - Answer: Tells PyTorch to track operations on this tensor for gradient computation
+
+8. **How do you get the maximum value in a tensor?**
+   - Answer: `t.max()`
+
+9. **What is a computational graph?**
+   - Answer: A record of all operations performed on tensors, used for backpropagation
+
+10. **How do you clone a tensor?**
+    - Answer: `t.clone()`
