@@ -57,7 +57,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - 10-question quiz with answers
 
 - **GitHub-Ready Structure**
-  - CI/CD workflows (linting, type-checking, code validation)
   - Issue templates (bug reports, feature requests)
   - PR template with checklist
   - Contributing guidelines
